@@ -849,9 +849,51 @@ function installFetchInterceptor() {
                 let accumulatedOutText = "";
                 let accumulatedThinkText = "";
 
+                const processSseLine = (line) => {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith("data:")) return;
+                    const jsonStr = trimmed.slice(5).trim();
+                    if (!jsonStr || jsonStr === "[DONE]") return;
+                    try {
+                        const chunk = JSON.parse(jsonStr);
+                        if (chunk.model) respModel = chunk.model;
+                        if (chunk.message?.model) respModel = chunk.message.model;
+                        const u = extractUsageFromPayload(chunk);
+                        if (u) usage = u;
+
+                        // OpenAI SSE
+                        const delta = chunk.choices?.[0]?.delta;
+                        if (delta?.content) accumulatedOutText += delta.content;
+                        if (delta?.reasoning_content || delta?.reasoning) {
+                            accumulatedThinkText += (delta.reasoning_content || delta.reasoning);
+                        }
+
+                        // Anthropic SSE
+                        if (chunk.delta?.type === "text_delta" && chunk.delta.text) {
+                            accumulatedOutText += chunk.delta.text;
+                        }
+                        if (chunk.delta?.type === "thinking_delta" && chunk.delta.thinking) {
+                            accumulatedThinkText += chunk.delta.thinking;
+                        }
+
+                        // Gemini 네이티브 SSE
+                        const gemParts = chunk.candidates?.[0]?.content?.parts;
+                        if (Array.isArray(gemParts)) {
+                            gemParts.forEach(p => {
+                                if (!p?.text) return;
+                                if (p.thought) accumulatedThinkText += p.text;
+                                else accumulatedOutText += p.text;
+                            });
+                        }
+                    } catch { /* ignore partial */ }
+                };
+
+                const looksLikeStream = contentType.includes("text/event-stream")
+                    || (Boolean(reqBody?.stream || reqBody?.streaming) && !contentType.includes("application/json"));
+
                 if (isBinaryResp) {
                     cloned.body?.cancel().catch(() => {});
-                } else if (contentType.includes("text/event-stream")) {
+                } else if (looksLikeStream) {
                     const reader = cloned.body?.getReader();
                     if (reader) {
                         const decoder = new TextDecoder("utf-8");
@@ -862,53 +904,26 @@ function installFetchInterceptor() {
                             buffer += decoder.decode(value, { stream: true });
                             const lines = buffer.split("\n");
                             buffer = lines.pop() || "";
-                            for (const line of lines) {
-                                const trimmed = line.trim();
-                                if (!trimmed.startsWith("data:")) continue;
-                                const jsonStr = trimmed.slice(5).trim();
-                                if (!jsonStr || jsonStr === "[DONE]") continue;
-                                try {
-                                    const chunk = JSON.parse(jsonStr);
-                                    if (chunk.model) respModel = chunk.model;
-                                    if (chunk.message?.model) respModel = chunk.message.model;
-                                    const u = extractUsageFromPayload(chunk);
-                                    if (u) usage = u;
-
-                                    // OpenAI SSE
-                                    const delta = chunk.choices?.[0]?.delta;
-                                    if (delta?.content) accumulatedOutText += delta.content;
-                                    if (delta?.reasoning_content || delta?.reasoning) {
-                                        accumulatedThinkText += (delta.reasoning_content || delta.reasoning);
-                                    }
-
-                                    // Anthropic SSE
-                                    if (chunk.delta?.type === "text_delta" && chunk.delta.text) {
-                                        accumulatedOutText += chunk.delta.text;
-                                    }
-                                    if (chunk.delta?.type === "thinking_delta" && chunk.delta.thinking) {
-                                        accumulatedThinkText += chunk.delta.thinking;
-                                    }
-
-                                    // Gemini 네이티브 SSE
-                                    const gemParts = chunk.candidates?.[0]?.content?.parts;
-                                    if (Array.isArray(gemParts)) {
-                                        gemParts.forEach(p => {
-                                            if (!p?.text) return;
-                                            if (p.thought) accumulatedThinkText += p.text;
-                                            else accumulatedOutText += p.text;
-                                        });
-                                    }
-                                } catch { /* ignore partial */ }
-                            }
+                            for (const line of lines) processSseLine(line);
                         }
+                        if (buffer.trim()) processSseLine(buffer);
                     }
                 } else {
-                    const data = await cloned.json();
-                    if (data?.model) respModel = data.model;
-                    usage = extractUsageFromPayload(data);
-                    const extracted = extractOutputFromResponseData(data);
-                    accumulatedOutText = extracted.outText;
-                    accumulatedThinkText = extracted.thinkText;
+                    const rawText = await cloned.text();
+                    const trimmedRaw = rawText.trimStart();
+                    if (!trimmedRaw) {
+                        // 빈 응답은 무시
+                    } else if (trimmedRaw.startsWith("data:") || trimmedRaw.includes("\ndata:")) {
+                        // Content-Type이 text/event-stream이 아니어도 본문이 SSE 형식이면 SSE 파서로 안전 처리
+                        trimmedRaw.split("\n").forEach(processSseLine);
+                    } else {
+                        const data = JSON.parse(trimmedRaw);
+                        if (data?.model) respModel = data.model;
+                        usage = extractUsageFromPayload(data);
+                        const extracted = extractOutputFromResponseData(data);
+                        accumulatedOutText = extracted.outText;
+                        accumulatedThinkText = extracted.thinkText;
+                    }
                 }
 
                 const curSettings = getSettings();
