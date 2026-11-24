@@ -1,5 +1,5 @@
 /* =========================================================
-   Gemini Cost Calculator v1.0.1 - Clean Slate UI + Multi-Model
+   Gemini Cost Calculator v1.1.0 - Clean Slate UI + Multi-Model
    ========================================================= */
 
 .gcost-row {
@@ -276,6 +276,8 @@
     border-bottom: 1px solid #f1f5f9;
     background: #fafafa;
     flex-shrink: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
 }
 
 .gcost-tab-btn {
@@ -882,6 +884,7 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
 }
 
@@ -979,4 +982,89 @@
     white-space: pre-wrap;
     word-break: break-word;
     user-select: all;
+}
+
+/* =========================================================
+   모바일 반응형 (좁은 화면 · 터치 환경 최적화)
+   ========================================================= */
+@media (max-width: 520px) {
+    .gcost-modal-overlay {
+        padding: 8px;
+    }
+
+    .gcost-modal {
+        max-height: 88vh;
+        border-radius: 12px;
+    }
+
+    .gcost-modal-header {
+        padding: 10px 12px;
+    }
+
+    .gcost-modal-header h3 {
+        font-size: 14px;
+    }
+
+    .gcost-modal-header-right {
+        gap: 8px;
+    }
+
+    .gcost-tabs {
+        padding: 6px 10px 0 10px;
+    }
+
+    .gcost-tab-btn {
+        padding: 7px 9px;
+        font-size: 12px;
+    }
+
+    .gcost-modal-body {
+        padding: 10px 12px;
+    }
+
+    .gcost-summary-cards.gcost-cards-3 {
+        grid-template-columns: 1fr;
+        gap: 6px;
+    }
+
+    .gcost-summary-cards {
+        grid-template-columns: 1fr;
+        gap: 6px;
+    }
+
+    .gcost-meta-grid {
+        grid-template-columns: 1fr;
+        gap: 4px;
+    }
+
+    .gcost-mset-grid2,
+    .gcost-mset-grid3 {
+        grid-template-columns: 1fr;
+        gap: 8px;
+    }
+
+    .gcost-compare-row {
+        gap: 6px;
+        padding: 6px 8px;
+        font-size: 11.5px;
+    }
+
+    .gcost-model-krw {
+        min-width: 52px;
+    }
+
+    .gcost-insight-bar {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
+    }
+
+    .gcost-insight-note {
+        text-align: left;
+        white-space: normal;
+    }
+
+    .gcost-modal-footer {
+        padding: 8px 12px;
+    }
 }

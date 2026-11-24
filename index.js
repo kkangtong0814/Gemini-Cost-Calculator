@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "1.0.1";
+const EXT_VERSION = "1.1.0";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -106,7 +106,35 @@ const WRAPPER_EXTENSION_FRAMES = [
 let lastPromptTokens = 0;
 let lastMainPromptAt = 0;
 let lastCapturedMainRecord = null;
+let pendingMainFetchPromise = null;
 const notifiedBudgetFlags = new Set();
+const tokenCountCache = new Map();
+
+async function getCachedTokenCount(text) {
+    const str = String(text || "");
+    if (!str) return 0;
+    const cacheKey = `${str.length}:${str.slice(0, 64)}:${str.slice(-32)}`;
+    if (tokenCountCache.has(cacheKey)) return tokenCountCache.get(cacheKey);
+    const count = await getTokenCountAsync(str);
+    if (tokenCountCache.size >= 3000) {
+        const firstKey = tokenCountCache.keys().next().value;
+        if (firstKey !== undefined) tokenCountCache.delete(firstKey);
+    }
+    tokenCountCache.set(cacheKey, count);
+    return count;
+}
+
+function getEffectiveMaxContext() {
+    try {
+        const ctx = window.SillyTavern?.getContext?.() || {};
+        const candidates = [
+            Number(ctx.maxContext),
+            Number(ctx.chatCompletionSettings?.openai_max_context),
+        ].filter(n => Number.isFinite(n) && n >= 2048);
+        if (candidates.length > 0) return candidates[0];
+    } catch { /* ignore */ }
+    return 0;
+}
 
 function getTodayKey() {
     const now = new Date();
@@ -142,7 +170,7 @@ function loadRecentLogs() {
 }
 
 function saveRecentLogs(logs) {
-    localStorage.setItem(RECENT_LOGS_KEY, JSON.stringify(logs.slice(0, 40)));
+    localStorage.setItem(RECENT_LOGS_KEY, JSON.stringify(logs.slice(0, 100)));
 }
 
 function loadErrorLogs() {
@@ -887,7 +915,7 @@ function installFetchInterceptor() {
         const response = await originalFetch(...args);
 
         // 비동기 백그라운드에서 복제된 응답 분석 (실리태번 스트리밍/성능에 영향 없음)
-        (async () => {
+        const analyzePromise = (async () => {
             try {
                 if (!response.ok) return;
                 const cloned = response.clone();
@@ -1053,6 +1081,14 @@ function installFetchInterceptor() {
             }
         })();
 
+        if (category === "main") {
+            pendingMainFetchPromise = analyzePromise.finally(() => {
+                if (pendingMainFetchPromise === analyzePromise) {
+                    pendingMainFetchPromise = null;
+                }
+            });
+        }
+
         return response;
     };
 }
@@ -1104,6 +1140,16 @@ async function onMessageReceived(messageId) {
 
     const message = chat[messageId];
     if (!message || message.is_user || message.is_system) return;
+
+    // fetch 인터셉터의 백그라운드 스트림 분석이 아직 진행 중이면 최대 800ms 대기 (미세 타이밍 중복 집계 방지)
+    if (settings.interceptFetch && !lastCapturedMainRecord && pendingMainFetchPromise) {
+        try {
+            await Promise.race([
+                pendingMainFetchPromise,
+                new Promise(resolve => setTimeout(resolve, 800)),
+            ]);
+        } catch { /* ignore */ }
+    }
 
     // fetch 인터셉터가 방금 메인 응답을 캡처했다면 그 실측/모델 데이터를 그대로 말풍선에 연결 (중복 집계 방지)
     if (settings.interceptFetch && lastCapturedMainRecord && (Date.now() - lastCapturedMainRecord.capturedAt) < 15000) {
@@ -1387,18 +1433,24 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
             ? upToIndex
             : chat.length - 1;
 
+        if (maxIdx > 80 && window.toastr) {
+            toastr.info(`장기 채팅(${maxIdx + 1}개 메시지) 토큰을 계산하고 있어요…`, "", { timeOut: 1800 });
+        }
+
+        const maxContextLimit = getEffectiveMaxContext();
         let runningContext = Math.max(0, Number(basePromptInfo.tokens) || 0);
         let prevContextForCache = 0;
         let aiTurnCount = 0;
         let sumNormalIn = 0, sumCacheIn = 0, sumOut = 0, sumThink = 0, sumUsd = 0;
         let sumRerollCount = 0, sumRerollKrw = 0;
+        let contextCapped = false;
         const turnRecords = [];
 
         for (let i = 0; i <= maxIdx; i++) {
             const msg = chat[i];
             if (!msg || msg.is_system) continue;
 
-            const msgTokens = msg.extra?.token_count || await getTokenCountAsync(msg.mes || "");
+            const msgTokens = msg.extra?.token_count || await getCachedTokenCount(msg.mes || "");
             if (msg.is_user) {
                 runningContext += msgTokens;
                 continue;
@@ -1410,8 +1462,12 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
                 sumRerollCount += prevCost.rerollCount;
                 sumRerollKrw += prevCost.rerollExtraKrw || 0;
             }
-            const thinkTokens = msg.extra?.reasoning ? await getTokenCountAsync(msg.extra.reasoning) : 0;
-            const totalInput = runningContext;
+            const thinkTokens = msg.extra?.reasoning ? await getCachedTokenCount(msg.extra.reasoning) : 0;
+            let totalInput = runningContext;
+            if (maxContextLimit > 0 && totalInput > maxContextLimit) {
+                totalInput = maxContextLimit;
+                contextCapped = true;
+            }
 
             let cacheTokens = 0;
             if (aiTurnCount > 1 && prevContextForCache > 0) {
@@ -1435,18 +1491,22 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
             });
 
             runningContext += msgTokens;
-            prevContextForCache = runningContext;
+            prevContextForCache = maxContextLimit > 0 ? Math.min(runningContext, maxContextLimit) : runningContext;
         }
 
-        const nextCache = Math.floor(runningContext * (settings.cacheRate / 100));
-        const nextNormal = Math.max(0, runningContext - nextCache);
+        const effectiveNextContext = maxContextLimit > 0 ? Math.min(runningContext, maxContextLimit) : runningContext;
+        const nextCache = Math.floor(effectiveNextContext * (settings.cacheRate / 100));
+        const nextNormal = Math.max(0, effectiveNextContext - nextCache);
         const nextAvgOut = aiTurnCount > 0 ? Math.round((sumOut + sumThink) / aiTurnCount) : 800;
         const { costUsd: nextTurnUsd } = calcTurnCostUsd(
-            nextNormal, nextCache, nextAvgOut, 0, runningContext, settings
+            nextNormal, nextCache, nextAvgOut, 0, effectiveNextContext, settings
         );
 
         chatResult = {
-            maxIdx, aiTurnCount, runningContext,
+            maxIdx, aiTurnCount,
+            runningContext: effectiveNextContext,
+            rawRunningContext: runningContext,
+            maxContextLimit, contextCapped,
             sumNormalIn, sumCacheIn, sumOut, sumThink,
             sumUsd, sumKrw: sumUsd * settings.exchangeRate,
             nextTurnUsd, nextTurnKrw: nextTurnUsd * settings.exchangeRate,
@@ -2077,9 +2137,9 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             ${tierWarnHtml}
 
             <div class="gcost-meta-grid">
-                <div class="gcost-meta-item" title="고정 프롬프트 ${(basePromptInfo?.tokens ?? settings.basePromptTokens).toLocaleString()}t (${escapeHtml(basePromptInfo?.detail || "설정값")})">
+                <div class="gcost-meta-item" title="고정 프롬프트 ${(basePromptInfo?.tokens ?? settings.basePromptTokens).toLocaleString()}t (${escapeHtml(basePromptInfo?.detail || "설정값")})${result.contextCapped ? ` · 최대 컨텍스트(${fmtK(result.maxContextLimit)}t) 상한 적용됨` : ""}">
                     <span class="gcost-meta-label">현재 컨텍스트</span>
-                    <span class="gcost-meta-val">${fmtK(result.runningContext)}t</span>
+                    <span class="gcost-meta-val">${fmtK(result.runningContext)}t${result.contextCapped ? " (상한)" : ""}</span>
                 </div>
                 <div class="gcost-meta-item">
                     <span class="gcost-meta-label">캐시 적중률</span>
@@ -2203,6 +2263,15 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         $btn.addClass("active").text("자동").attr("title", `현재 산출: ${est.detail}`);
         if (window.toastr) {
             toastr.info(`고정 프롬프트 ${est.tokens.toLocaleString()}t (${est.detail})`);
+        }
+    });
+
+    // 탭 2 최근 로그 행 터치/클릭 시 상세 토큰 내역 표시 (모바일 호버 불가 대응)
+    modalHtml.on("click", ".gcost-log-row", function (e) {
+        if ($(e.target).closest(".gcost-log-del-btn").length) return;
+        const tip = $(this).attr("title");
+        if (tip && window.toastr) {
+            toastr.info(tip.replace(/\n/g, " · "), "호출 상세", { timeOut: 4000 });
         }
     });
 
