@@ -1,0 +1,11 @@
+{
+    "display_name": "Gemini Cost Calculator",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "kkangtong0814",
+    "version": "1.0.0",
+    "homePage": "https://github.com/kkangtong0814/Gemini-Cost-Calculator"
+}
