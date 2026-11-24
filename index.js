@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "1.0.0";
+const EXT_VERSION = "1.0.1";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -388,6 +388,7 @@ function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, c
     const logs = loadRecentLogs();
     logs.unshift({
         id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        ts: Date.now(),
         date: today,
         time: getTimeStr(),
         category,
@@ -1316,11 +1317,12 @@ async function estimateBasePromptTokens(maxIdx = null) {
 
 /**
  * 최근 API 실측 메인 호출 기록에서 평균 프롬프트 캐시 적중률 자동 산출 (AI 호출 없음)
+ * Gemini 암묵적 캐싱 최소 기준(1,024t) 미만 초단발/테스트 호출은 제외
  */
 function estimateMeasuredCacheRate(fallbackRate = 80) {
     try {
         const logs = loadRecentLogs();
-        const measured = logs.filter(l => l.category === "main" && l.isEstimated === false && l.totalInput > 0);
+        const measured = logs.filter(l => l.category === "main" && l.isEstimated === false && (l.totalInput || 0) >= 1024);
         if (measured.length > 0) {
             const sumIn = measured.reduce((acc, l) => acc + (l.totalInput || 0), 0);
             const sumCache = measured.reduce((acc, l) => acc + (l.cacheTokens || 0), 0);
@@ -1564,16 +1566,33 @@ function buildLiveStatsHtml() {
     }
     const budgetHtml = budgetBars.length > 0 ? `<div class="gcost-budget-box">${budgetBars.join("")}</div>` : "";
 
-    // 2. 실측 프롬프트 캐시 적중률 모니터링 (최근 실측 메인 호출 기준)
-    const measuredMainLogs = logs.filter(l => l.category === "main" && l.isEstimated === false && l.totalInput > 0);
+    // 2. 실측 프롬프트 캐시 적중률 모니터링 (1,024t 이상 실측 메인 호출 기준 + 5분 초과 만료 구분)
+    const measuredMainLogs = logs.filter(l => l.category === "main" && l.isEstimated === false && (l.totalInput || 0) >= 1024);
     let cacheInsightHtml = "";
     if (measuredMainLogs.length > 0) {
         const sumIn = measuredMainLogs.reduce((acc, l) => acc + (l.totalInput || 0), 0);
         const sumCache = measuredMainLogs.reduce((acc, l) => acc + (l.cacheTokens || 0), 0);
         const hitPct = sumIn > 0 ? Math.round((sumCache / sumIn) * 100) : 0;
+
+        // 최근 호출 간격이 대부분 5분(300초)을 넘겼는지 확인
+        let longGapCount = 0;
+        let gapPairs = 0;
+        for (let i = 0; i < measuredMainLogs.length - 1; i++) {
+            const newer = measuredMainLogs[i].ts;
+            const older = measuredMainLogs[i + 1].ts;
+            if (newer && older && newer >= older) {
+                gapPairs += 1;
+                if ((newer - older) > 5 * 60 * 1000) longGapCount += 1;
+            }
+        }
+        const mostlyExpiredByGap = gapPairs > 0 && (longGapCount / gapPairs) >= 0.5;
+
         let statusClass = "ok";
         let statusNote = `최근 실측 ${measuredMainLogs.length}회 평균 · 정상 작동`;
-        if (hitPct === 0 && measuredMainLogs.length >= 2) {
+        if (hitPct < 50 && mostlyExpiredByGap) {
+            statusClass = "warn";
+            statusNote = `답장 간격 5분 초과로 캐시 자연 만료 (${measuredMainLogs.length}회 평균)`;
+        } else if (hitPct === 0 && measuredMainLogs.length >= 2) {
             statusClass = "warn";
             statusNote = "캐시 미작동 · 프롬프트 순서/로어북 점검 권장";
         } else if (hitPct < 50) {
@@ -1665,14 +1684,24 @@ function buildLiveStatsHtml() {
     const recentRows = logs.slice(0, 8).map((l, idx) => {
         const showCaller = l.callerLabel && l.callerLabel !== "메인 채팅" && l.callerLabel !== CATEGORY_LABELS[l.category];
         const callerTag = showCaller ? `<span class="gcost-caller-tag" title="${escapeHtml(l.callerLabel)}">${escapeHtml(l.callerLabel)}</span>` : "";
+        const totalIn = l.totalInput || 0;
+        const cacheIn = l.cacheTokens || 0;
+        const normalIn = Math.max(0, totalIn - cacheIn);
+        const outT = l.outTokens || 0;
+        const thinkT = l.thinkTokens || 0;
+        const logTip = [
+            `[${l.isEstimated ? "로컬 추정" : "API 실측"}] ${l.modelLabel} (${l.date || ""} ${l.time || ""})`,
+            `입력 ${totalIn.toLocaleString()}t (캐시 ${cacheIn.toLocaleString()}t / 일반 ${normalIn.toLocaleString()}t)`,
+            `출력 ${outT.toLocaleString()}t (생각 ${thinkT.toLocaleString()}t 포함)`,
+        ].join("\n");
         return `
-            <div class="gcost-compare-row gcost-log-row">
+            <div class="gcost-compare-row gcost-log-row" title="${escapeHtml(logTip)}">
                 <span class="gcost-model-name">
                     <span class="gcost-cat-badge cat-${escapeHtml(l.category)}">${escapeHtml(CATEGORY_LABELS[l.category] || l.category)}</span>
                     ${callerTag}
                     <span>${escapeHtml(l.modelLabel)}</span>
                 </span>
-                <span class="gcost-model-usd">${escapeHtml(l.time)} · ${fmtK(l.totalInput)}→${fmtK(l.outTokens + (l.thinkTokens || 0))}</span>
+                <span class="gcost-model-usd">${escapeHtml(l.time)} · ${fmtK(totalIn)}→${fmtK(outT + thinkT)}</span>
                 <span class="gcost-model-krw">${Math.round(l.costKrw).toLocaleString()}원</span>
                 <button type="button" class="gcost-log-del-btn" data-log-idx="${idx}" title="이 로그 삭제 및 통계에서 차감">×</button>
             </div>
@@ -2242,6 +2271,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             inBase: cIn, cacheBase: cCache, outBase: cOut,
             inHigh: cIn, cacheHigh: cCache, outHigh: cOut,
         });
+        syncDrawerPresetOptions(getSettings());
 
         if (window.toastr) toastr.success(`"${cName}" 커스텀 프리셋을 추가했습니다.`);
         openCostModal(upToIndex, "settings");
@@ -2262,6 +2292,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             Object.assign(patch, { preset: "gemini-4-carbon-promo", ...pricing });
         }
         updateSettings(patch);
+        syncDrawerPresetOptions(getSettings());
         if (window.toastr) toastr.info("커스텀 프리셋을 삭제했습니다.");
         openCostModal(upToIndex, "settings");
     });
@@ -2309,6 +2340,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
 
         // 확장 설정 패널 UI도 함께 동기화
         const updated = getSettings();
+        syncDrawerPresetOptions(updated);
         $("#gcost_exchange_rate").val(updated.exchangeRate);
         $("#gcost_preset").val(updated.preset);
         $("#gcost_in_base").val(updated.inBase);
@@ -2559,6 +2591,21 @@ function injectChatMenuButtons() {
     }
 }
 
+function syncDrawerPresetOptions(cfg) {
+    const $sel = $("#gcost_preset");
+    if (!$sel.length) return;
+    const customs = Array.isArray(cfg?.customPresets) ? cfg.customPresets : [];
+    const optionsHtml = Object.entries(PRESETS).map(([key, p]) =>
+        `<option value="${key}">${escapeHtml(p.label)}</option>`
+    ).join("")
+        + customs.map(c =>
+            `<option value="${escapeHtml(c.id)}">${escapeHtml(c.label)} (커스텀)</option>`
+        ).join("")
+        + `<option value="custom">직접 입력 (Custom)</option>`;
+    $sel.html(optionsHtml);
+    $sel.val(cfg?.preset || "gemini-4-carbon-promo");
+}
+
 function bindSettingsUI() {
     const s = getSettings();
 
@@ -2566,7 +2613,7 @@ function bindSettingsUI() {
         $("#gcost_enabled").prop("checked", cfg.enabled);
         $("#gcost_intercept_fetch").prop("checked", cfg.interceptFetch);
         $("#gcost_auto_model_pricing").prop("checked", cfg.autoModelPricing);
-        $("#gcost_preset").val(cfg.preset);
+        syncDrawerPresetOptions(cfg);
         $("#gcost_tier_threshold").val(cfg.tierThreshold);
         $("#gcost_in_base").val(cfg.inBase);
         $("#gcost_cache_base").val(cfg.cacheBase);
@@ -2605,8 +2652,9 @@ function bindSettingsUI() {
 
     $("#gcost_preset").on("change", function () {
         const val = $(this).val();
-        if (PRESETS[val]) {
-            const { label, shortLabel, ...pricing } = PRESETS[val];
+        const found = findPresetByKey(val, getSettings());
+        if (found) {
+            const { label, shortLabel, isCustom, ...pricing } = found;
             updateSettings({ preset: val, ...pricing });
             syncInputs(getSettings());
         } else {
@@ -2703,10 +2751,32 @@ jQuery(async () => {
 
         const chatEl = document.getElementById("chat");
         if (chatEl) {
+            let injectTimer = null;
             const observer = new MutationObserver(() => {
-                injectMessageMoreButtons();
+                if (injectTimer) clearTimeout(injectTimer);
+                injectTimer = setTimeout(() => {
+                    injectTimer = null;
+                    injectMessageMoreButtons();
+                }, 100);
             });
             observer.observe(chatEl, { childList: true });
+        }
+
+        // ESC 키로 최상단 모달(오류 확인 창 → 메인 모달 순) 닫기
+        if (!window.__gcostEscBound) {
+            window.__gcostEscBound = true;
+            document.addEventListener("keydown", (e) => {
+                if (e.key !== "Escape") return;
+                const $diag = $(".gcost-diag-overlay");
+                if ($diag.length) {
+                    $diag.remove();
+                    return;
+                }
+                const $main = $(".gcost-modal-overlay");
+                if ($main.length) {
+                    $main.remove();
+                }
+            });
         }
 
         eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
