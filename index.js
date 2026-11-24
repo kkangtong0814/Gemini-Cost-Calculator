@@ -2426,9 +2426,10 @@ function renderAllBadges() {
         if (rerollCount > 0) {
             tooltipLines.push(`[리롤] ${rerollCount}회 숨은 비용 +${Math.round(rerollExtraKrw).toLocaleString()}원 (이 턴 총 ${Math.round(turnTotalKrw).toLocaleString()}원)`);
         }
+        tooltipLines.push("클릭하면 비용 계산기를 열어요");
 
         const badge = $(`
-            <div class="gcost-badge" title="${escapeHtml(tooltipLines.join("\n"))}">
+            <div class="gcost-badge" role="button" tabindex="0" title="${escapeHtml(tooltipLines.join("\n"))}">
                 ${modelTag}
                 <span>${estPrefix}${turnText}</span>
                 ${rerollTag}
@@ -2437,6 +2438,11 @@ function renderAllBadges() {
                 ${tierTag}
             </div>
         `);
+
+        badge.on("click", (e) => {
+            e.stopPropagation();
+            openCostModal(index, "chat");
+        });
 
         mesEl.append(badge);
     });
