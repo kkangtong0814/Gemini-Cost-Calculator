@@ -68,6 +68,7 @@ const DEFAULT_SETTINGS = {
     autoModelPricing: true,
     preset: "gemini-4-carbon-promo",
     customName: "직접 입력",
+    customPresets: [],
     tierThreshold: 200000,
     inBase: 2.00,
     cacheBase: 0.10,
@@ -248,12 +249,35 @@ async function copyTextToClipboard(text) {
     }
 }
 
+function findPresetByKey(key, settings) {
+    if (!key) return null;
+    if (PRESETS[key]) return PRESETS[key];
+    const customs = Array.isArray(settings?.customPresets) ? settings.customPresets : [];
+    const found = customs.find(c => c.id === key);
+    if (found) {
+        return {
+            label: `${found.label} (커스텀)`,
+            shortLabel: found.label,
+            tierThreshold: found.tierThreshold ?? 200000,
+            inBase: found.inBase,
+            cacheBase: found.cacheBase,
+            outBase: found.outBase,
+            inHigh: found.inHigh ?? found.inBase,
+            cacheHigh: found.cacheHigh ?? found.cacheBase,
+            outHigh: found.outHigh ?? found.outBase,
+            isCustom: true,
+        };
+    }
+    return null;
+}
+
 function getSettings() {
     if (!extension_settings[MODULE_NAME]) {
-        extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS };
+        extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS, customPresets: [] };
     }
     const merged = Object.assign({}, DEFAULT_SETTINGS, extension_settings[MODULE_NAME]);
-    if (merged.preset !== "custom" && !PRESETS[merged.preset]) {
+    if (!Array.isArray(merged.customPresets)) merged.customPresets = [];
+    if (merged.preset !== "custom" && !findPresetByKey(merged.preset, merged)) {
         const { label, shortLabel, ...pricing } = PRESETS["gemini-4-carbon-promo"];
         Object.assign(merged, { preset: "gemini-4-carbon-promo", ...pricing });
         extension_settings[MODULE_NAME] = merged;
@@ -296,8 +320,9 @@ function resolveModelPricing(modelName, settings) {
         }
     }
 
+    const activePresetObj = findPresetByKey(settings.preset, settings);
     const fallbackLabel = raw
-        || (settings.preset === "custom" ? (settings.customName?.trim() || "직접 입력") : PRESETS[settings.preset]?.shortLabel)
+        || (settings.preset === "custom" ? (settings.customName?.trim() || "직접 입력") : activePresetObj?.shortLabel)
         || "Custom";
     return {
         key: settings.preset || "custom",
@@ -1698,10 +1723,29 @@ function buildLiveStatsHtml() {
 }
 
 function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo = null) {
+    const customs = Array.isArray(settings.customPresets) ? settings.customPresets : [];
     const presetOptions = Object.entries(PRESETS).map(([key, p]) => {
         const sel = settings.preset === key ? "selected" : "";
         return `<option value="${key}" ${sel}>${p.label}</option>`;
-    }).join("") + `<option value="custom" ${settings.preset === "custom" ? "selected" : ""}>직접 입력 (Custom)</option>`;
+    }).join("")
+        + customs.map(c => {
+            const sel = settings.preset === c.id ? "selected" : "";
+            return `<option value="${escapeHtml(c.id)}" ${sel}>${escapeHtml(c.label)} (커스텀)</option>`;
+        }).join("")
+        + `<option value="custom" ${settings.preset === "custom" ? "selected" : ""}>직접 입력 (Custom)</option>`;
+
+    const savedCustomListHtml = customs.length > 0 ? `
+        <div class="gcost-custom-saved-list">
+            <div class="gcost-custom-saved-title">저장된 커스텀 프리셋 (${customs.length})</div>
+            ${customs.map(c => `
+                <div class="gcost-custom-saved-row">
+                    <span class="gcost-custom-saved-name" title="${escapeHtml(c.label)}">${escapeHtml(c.label)}</span>
+                    <span class="gcost-custom-saved-price">$${c.inBase} / $${c.cacheBase} / $${c.outBase}</span>
+                    <button type="button" class="gcost-log-del-btn gcost-custom-del-btn" data-custom-id="${escapeHtml(c.id)}" title="이 커스텀 프리셋 삭제">×</button>
+                </div>
+            `).join("")}
+        </div>
+    ` : "";
 
     const quickRates = [1350, 1400, 1450, 1500];
     const rateChips = quickRates.map(r => {
@@ -1758,7 +1802,12 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
                         <input id="gcost_modal_out_base" type="number" step="0.01" min="0" class="gcost-mset-input" value="${settings.outBase}" />
                     </div>
                 </div>
+                <div class="gcost-custom-add-row">
+                    <span class="gcost-mset-hint">1M 토큰당 USD · 추가하면 비교표에 포함됩니다</span>
+                    <button type="button" id="gcost_modal_add_custom_btn" class="gcost-btn gcost-btn-primary gcost-btn-xs">+ 프리셋 추가</button>
+                </div>
             </div>
+            ${savedCustomListHtml}
             <div class="gcost-mset-grid2">
                 <div class="gcost-mset-row">
                     <label class="gcost-mset-label" for="gcost_modal_cache_rate">
@@ -1890,9 +1939,10 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     $(".gcost-modal-overlay").remove();
 
     const customLabel = (settings.customName || "").trim() || "직접 입력";
+    const activePresetObj = findPresetByKey(settings.preset, settings);
     const activeShort = settings.preset === "custom"
         ? customLabel
-        : (PRESETS[settings.preset]?.shortLabel || "직접 입력");
+        : (activePresetObj?.shortLabel || "직접 입력");
     let chatTabHtml = `<div class="gcost-empty-msg">현재 열려 있는 채팅 메시지가 없습니다.</div>`;
     let rangePill = "실시간 추적";
 
@@ -1906,6 +1956,23 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             label: preset.label,
             pricing: preset,
         }));
+
+        const savedCustoms = Array.isArray(settings.customPresets) ? settings.customPresets : [];
+        savedCustoms.forEach(c => {
+            compareEntries.push({
+                key: c.id,
+                label: `${c.label} (커스텀)`,
+                pricing: {
+                    tierThreshold: c.tierThreshold ?? 200000,
+                    inBase: c.inBase,
+                    cacheBase: c.cacheBase,
+                    outBase: c.outBase,
+                    inHigh: c.inHigh ?? c.inBase,
+                    cacheHigh: c.cacheHigh ?? c.cacheBase,
+                    outHigh: c.outHigh ?? c.outBase,
+                },
+            });
+        });
 
         if (settings.preset === "custom") {
             compareEntries.unshift({
@@ -2128,12 +2195,75 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             modalHtml.find("#gcost_modal_custom_box").show();
         } else {
             modalHtml.find("#gcost_modal_custom_box").hide();
-            if (PRESETS[val]) {
-                modalHtml.find("#gcost_modal_in_base").val(PRESETS[val].inBase);
-                modalHtml.find("#gcost_modal_cache_base").val(PRESETS[val].cacheBase);
-                modalHtml.find("#gcost_modal_out_base").val(PRESETS[val].outBase);
+            const found = findPresetByKey(val, getSettings());
+            if (found) {
+                modalHtml.find("#gcost_modal_in_base").val(found.inBase);
+                modalHtml.find("#gcost_modal_cache_base").val(found.cacheBase);
+                modalHtml.find("#gcost_modal_out_base").val(found.outBase);
             }
         }
+    });
+
+    // 커스텀 프리셋 목록에 추가 버튼
+    modalHtml.find("#gcost_modal_add_custom_btn").on("click", () => {
+        const cName = String(modalHtml.find("#gcost_modal_custom_name").val() || "").trim();
+        const cIn = parseFloat(modalHtml.find("#gcost_modal_in_base").val());
+        const cCache = parseFloat(modalHtml.find("#gcost_modal_cache_base").val());
+        const cOut = parseFloat(modalHtml.find("#gcost_modal_out_base").val());
+
+        if (!cName) {
+            if (window.toastr) toastr.warning("단가 이름을 입력해 주세요.");
+            return;
+        }
+        if (isNaN(cIn) || cIn < 0 || isNaN(cCache) || cCache < 0 || isNaN(cOut) || cOut < 0) {
+            if (window.toastr) toastr.warning("입력·캐시·출력 단가를 0 이상의 숫자로 입력해 주세요.");
+            return;
+        }
+
+        const cur = getSettings();
+        const list = Array.isArray(cur.customPresets) ? [...cur.customPresets] : [];
+        const newId = `custom_${Date.now()}`;
+        list.push({
+            id: newId,
+            label: cName,
+            tierThreshold: 200000,
+            inBase: cIn,
+            cacheBase: cCache,
+            outBase: cOut,
+            inHigh: cIn,
+            cacheHigh: cCache,
+            outHigh: cOut,
+        });
+
+        updateSettings({
+            customPresets: list,
+            preset: newId,
+            customName: cName,
+            inBase: cIn, cacheBase: cCache, outBase: cOut,
+            inHigh: cIn, cacheHigh: cCache, outHigh: cOut,
+        });
+
+        if (window.toastr) toastr.success(`"${cName}" 커스텀 프리셋을 추가했습니다.`);
+        openCostModal(upToIndex, "settings");
+    });
+
+    // 저장된 커스텀 프리셋 삭제 버튼
+    modalHtml.on("click", ".gcost-custom-del-btn", function () {
+        const delId = String($(this).data("custom-id") || "");
+        if (!delId) return;
+        const cur = getSettings();
+        const target = (cur.customPresets || []).find(c => c.id === delId);
+        if (!confirm(`"${target?.label || "커스텀"}" 프리셋을 삭제할까요?`)) return;
+
+        const nextList = (cur.customPresets || []).filter(c => c.id !== delId);
+        const patch = { customPresets: nextList };
+        if (cur.preset === delId) {
+            const { label, shortLabel, ...pricing } = PRESETS["gemini-4-carbon-promo"];
+            Object.assign(patch, { preset: "gemini-4-carbon-promo", ...pricing });
+        }
+        updateSettings(patch);
+        if (window.toastr) toastr.info("커스텀 프리셋을 삭제했습니다.");
+        openCostModal(upToIndex, "settings");
     });
 
     // 모달 내 설정 탭 백업 / 복원
@@ -2159,8 +2289,9 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         if (!isNaN(newDailyBudget) && newDailyBudget >= 0) patch.dailyBudgetKrw = newDailyBudget;
         if (!isNaN(newMonthlyBudget) && newMonthlyBudget >= 0) patch.monthlyBudgetKrw = newMonthlyBudget;
 
-        if (newPreset && PRESETS[newPreset]) {
-            const { label, shortLabel, ...pricing } = PRESETS[newPreset];
+        const matchedPreset = findPresetByKey(newPreset, getSettings());
+        if (newPreset && matchedPreset) {
+            const { label, shortLabel, isCustom, ...pricing } = matchedPreset;
             Object.assign(patch, { preset: newPreset, ...pricing });
         } else if (newPreset === "custom") {
             const cName = String(modalHtml.find("#gcost_modal_custom_name").val() || "").trim() || "직접 입력";
