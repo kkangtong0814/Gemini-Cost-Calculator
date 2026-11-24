@@ -31,6 +31,11 @@ SillyTavern에서 Gemini API 사용 비용을 원화(KRW)와 달러(USD)로 간�
    ```
 3. SillyTavern 새로고침
 
+## 저작권 및 이용 안내
+
+- **깡통 사이트 내에서만 자유롭게 수정, 재배포, 사용이 가능합니다.**
+- **외부 유출 및 외부 사이트 무단 배포를 금지합니다.**
+
 ## 감사 인사 (Credits)
 
 이 확장의 아이디어에 큰 영감을 주신 [model-badge](https://github.com/KKANGTONG4948/model-badge) 제작자분께 진심으로 감사드립니다.
