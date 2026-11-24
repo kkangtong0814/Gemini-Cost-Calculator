@@ -31,10 +31,20 @@ SillyTavern에서 Gemini API 사용 비용을 원화(KRW)와 달러(USD)로 간�
    ```
 3. SillyTavern 새로고침
 
-## 저작권 및 이용 안내
+## 개인정보 및 보안 안내
 
-- **깡통 사이트 내에서만 자유롭게 수정, 재배포, 사용이 가능합니다.**
-- **외부 유출 및 외부 사이트 무단 배포를 금지합니다.**
+- **별도 AI API 호출 없음:** 채팅 비용 계산 및 고정 프롬프트 측정 기능은 AI API를 호출하지 않고 로컬에서만 계산합니다.
+- **개인정보·API 키 미수집:** 사용자의 API 키, 개인정보, 채팅 내용은 외부 서버로 전송되거나 수집되지 않습니다.
+- **로컬 저장:** 모든 지출 통계와 로그는 사용자 브라우저(`localStorage`)에만 저장되며, `오류 확인` 리포트에도 API 키나 채팅 내용은 포함되지 않습니다.
+
+## 라이선스 (License)
+
+[Custom Community License (Kkangtong Only)](https://github.com/kkangtong0814/Gemini-Cost-Calculator/blob/main/LICENSE) — Copyright (c) 2026 kkangtong0814
+
+- 비상업적 목적(개인 사용·취미 등)의 설치·사용과 **깡통 사이트 내에서의 자유로운 수정·재배포**가 허용됩니다.
+- **외부 유출, 타 사이트 무단 재배포 및 상업적 이용은 금지됩니다.**
+- 보증 없이 있는 그대로 제공됩니다.
+- 위 요약은 이해를 돕기 위한 것이며, 정확한 조건은 [LICENSE](https://github.com/kkangtong0814/Gemini-Cost-Calculator/blob/main/LICENSE) 원문을 따릅니다.
 
 ## 감사 인사 (Credits)
 
