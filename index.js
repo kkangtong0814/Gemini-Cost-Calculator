@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "1.1.0";
+const EXT_VERSION = "1.1.1";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -1651,7 +1651,7 @@ function buildLiveStatsHtml() {
         let statusNote = `최근 실측 ${measuredMainLogs.length}회 평균 · 정상 작동`;
         if (hitPct < 50 && mostlyExpiredByGap) {
             statusClass = "warn";
-            statusNote = `답장 간격 5분 초과로 캐시 자연 만료 (${measuredMainLogs.length}회 평균)`;
+            statusNote = `요청 간격이 길어 캐시가 풀렸을 수 있어요 (${measuredMainLogs.length}회 평균)`;
         } else if (hitPct === 0 && measuredMainLogs.length >= 2) {
             statusClass = "warn";
             statusNote = "캐시 미작동 · 프롬프트 순서/로어북 점검 권장";
