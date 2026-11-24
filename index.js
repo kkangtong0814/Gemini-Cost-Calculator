@@ -67,6 +67,7 @@ const DEFAULT_SETTINGS = {
     interceptFetch: true,
     autoModelPricing: true,
     preset: "gemini-4-carbon-promo",
+    customName: "직접 입력",
     tierThreshold: 200000,
     inBase: 2.00,
     cacheBase: 0.10,
@@ -167,11 +168,33 @@ function recordErrorLog(code, context, err) {
         logs.unshift({
             code: String(code || "GCOST-ERR"),
             time: `${getTodayKey()} ${getTimeStr()}`,
+            ts: Date.now(),
             context: String(context || ""),
             message: message.slice(0, 300),
             stack: stack.slice(0, 500),
         });
         saveErrorLogs(logs);
+    } catch { /* ignore */ }
+}
+
+/**
+ * 해당 오류 코드의 작업이 정상적으로 성공하면 이전 오류 기록을 자동 해소
+ */
+function resolveErrorCode(code) {
+    try {
+        const logs = loadErrorLogs();
+        if (!logs.length) return;
+        const filtered = logs.filter(e => e.code !== code);
+        if (filtered.length === logs.length) return;
+        saveErrorLogs(filtered);
+        const $btn = $(".gcost-diag-btn");
+        if ($btn.length) {
+            if (filtered.length > 0) {
+                $btn.addClass("has-error").text(`오류 확인 · ${filtered.length}`);
+            } else {
+                $btn.removeClass("has-error").text("오류 확인");
+            }
+        }
     } catch { /* ignore */ }
 }
 
@@ -273,7 +296,9 @@ function resolveModelPricing(modelName, settings) {
         }
     }
 
-    const fallbackLabel = raw || PRESETS[settings.preset]?.shortLabel || "Custom";
+    const fallbackLabel = raw
+        || (settings.preset === "custom" ? (settings.customName?.trim() || "직접 입력") : PRESETS[settings.preset]?.shortLabel)
+        || "Custom";
     return {
         key: settings.preset || "custom",
         shortLabel: fallbackLabel.length > 22 ? fallbackLabel.slice(0, 22) + "…" : fallbackLabel,
@@ -500,6 +525,7 @@ function triggerImportCostData(onImported) {
                 saveRecentLogs(parsed.recentLogs);
             }
             renderStatsUI();
+            resolveErrorCode("GCOST-IMPORT");
             if (window.toastr) toastr.success("백업 파일에서 지출 통계를 복원했습니다.");
             if (typeof onImported === "function") onImported();
         } catch (err) {
@@ -990,6 +1016,7 @@ function installFetchInterceptor() {
                 };
 
                 recordApiUsage(record);
+                resolveErrorCode("GCOST-FETCH");
 
                 if (category === "main") {
                     lastCapturedMainRecord = record;
@@ -1020,6 +1047,7 @@ async function onPromptReady(eventData) {
         }).join("\n");
 
         lastPromptTokens = await getTokenCountAsync(fullText);
+        resolveErrorCode("GCOST-PROMPT");
     } catch (err) {
         recordErrorLog("GCOST-PROMPT", "프롬프트 토큰 계산", err);
         lastPromptTokens = 0;
@@ -1243,6 +1271,7 @@ async function estimateBasePromptTokens(maxIdx = null) {
             if (loreTokens > 0) parts.push(`로어북 ${loreTokens.toLocaleString()}`);
             if (personaTokens > 0) parts.push(`페르소나 ${personaTokens.toLocaleString()}`);
             if (metaTokens > 0) parts.push(`메모 ${metaTokens.toLocaleString()}`);
+            resolveErrorCode("GCOST-EST");
             return {
                 tokens: total,
                 source: "context",
@@ -1710,6 +1739,26 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
                     ${presetOptions}
                 </select>
             </div>
+            <div id="gcost_modal_custom_box" class="gcost-mset-custom-box" style="${settings.preset === "custom" ? "" : "display:none;"}">
+                <div class="gcost-mset-row">
+                    <label class="gcost-mset-label" for="gcost_modal_custom_name">직접 입력 단가 이름</label>
+                    <input id="gcost_modal_custom_name" type="text" maxlength="30" class="gcost-mset-input" placeholder="예: 내 커스텀 모델" value="${escapeHtml(settings.customName || "직접 입력")}" />
+                </div>
+                <div class="gcost-mset-grid3">
+                    <div class="gcost-mset-row">
+                        <label class="gcost-mset-label" for="gcost_modal_in_base">일반 입력 ($)</label>
+                        <input id="gcost_modal_in_base" type="number" step="0.01" min="0" class="gcost-mset-input" value="${settings.inBase}" />
+                    </div>
+                    <div class="gcost-mset-row">
+                        <label class="gcost-mset-label" for="gcost_modal_cache_base">캐시 입력 ($)</label>
+                        <input id="gcost_modal_cache_base" type="number" step="0.001" min="0" class="gcost-mset-input" value="${settings.cacheBase}" />
+                    </div>
+                    <div class="gcost-mset-row">
+                        <label class="gcost-mset-label" for="gcost_modal_out_base">출력·생각 ($)</label>
+                        <input id="gcost_modal_out_base" type="number" step="0.01" min="0" class="gcost-mset-input" value="${settings.outBase}" />
+                    </div>
+                </div>
+            </div>
             <div class="gcost-mset-grid2">
                 <div class="gcost-mset-row">
                     <label class="gcost-mset-label" for="gcost_modal_cache_rate">
@@ -1840,7 +1889,10 @@ function openDiagnosticModal() {
 function renderCombinedModal(settings, result, defaultTab, upToIndex = null, basePromptInfo = null, cacheRateInfo = null) {
     $(".gcost-modal-overlay").remove();
 
-    const activeShort = PRESETS[settings.preset]?.shortLabel || "직접 입력";
+    const customLabel = (settings.customName || "").trim() || "직접 입력";
+    const activeShort = settings.preset === "custom"
+        ? customLabel
+        : (PRESETS[settings.preset]?.shortLabel || "직접 입력");
     let chatTabHtml = `<div class="gcost-empty-msg">현재 열려 있는 채팅 메시지가 없습니다.</div>`;
     let rangePill = "실시간 추적";
 
@@ -1849,11 +1901,25 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             ? `전체 · AI ${result.aiTurnCount}턴`
             : `#${result.maxIdx}까지 · AI ${result.aiTurnCount}턴`;
 
-        const compareRows = Object.entries(PRESETS).map(([key, preset]) => {
+        const compareEntries = Object.entries(PRESETS).map(([key, preset]) => ({
+            key,
+            label: preset.label,
+            pricing: preset,
+        }));
+
+        if (settings.preset === "custom") {
+            compareEntries.unshift({
+                key: "custom",
+                label: `${customLabel} (직접 입력)`,
+                pricing: settings,
+            });
+        }
+
+        const compareRows = compareEntries.map(({ key, label, pricing }) => {
             let modelUsd = 0;
             result.turnRecords.forEach(t => {
                 const { costUsd } = calcTurnCostUsd(
-                    t.normalInput, t.cacheTokens, t.outTokens, t.thinkTokens, t.totalInput, preset
+                    t.normalInput, t.cacheTokens, t.outTokens, t.thinkTokens, t.totalInput, pricing
                 );
                 modelUsd += costUsd;
             });
@@ -1861,7 +1927,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             const activeClass = settings.preset === key ? "gcost-active-row" : "";
             return `
                 <div class="gcost-compare-row ${activeClass}">
-                    <span class="gcost-model-name">${preset.label}</span>
+                    <span class="gcost-model-name">${escapeHtml(label)}</span>
                     <span class="gcost-model-usd">$${modelUsd.toFixed(4)}</span>
                     <span class="gcost-model-krw">약 ${modelKrw}원</span>
                 </div>
@@ -2055,6 +2121,21 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         }
     });
 
+    // 직접 입력(Custom) 프리셋 선택 시 커스텀 단가 입력 박스 토글
+    modalHtml.find("#gcost_modal_preset").on("change", function () {
+        const val = $(this).val();
+        if (val === "custom") {
+            modalHtml.find("#gcost_modal_custom_box").show();
+        } else {
+            modalHtml.find("#gcost_modal_custom_box").hide();
+            if (PRESETS[val]) {
+                modalHtml.find("#gcost_modal_in_base").val(PRESETS[val].inBase);
+                modalHtml.find("#gcost_modal_cache_base").val(PRESETS[val].cacheBase);
+                modalHtml.find("#gcost_modal_out_base").val(PRESETS[val].outBase);
+            }
+        }
+    });
+
     // 모달 내 설정 탭 백업 / 복원
     modalHtml.find("#gcost_modal_export_btn").on("click", () => exportCostData());
     modalHtml.find("#gcost_modal_import_btn").on("click", () => {
@@ -2082,7 +2163,15 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             const { label, shortLabel, ...pricing } = PRESETS[newPreset];
             Object.assign(patch, { preset: newPreset, ...pricing });
         } else if (newPreset === "custom") {
+            const cName = String(modalHtml.find("#gcost_modal_custom_name").val() || "").trim() || "직접 입력";
+            const cIn = parseFloat(modalHtml.find("#gcost_modal_in_base").val());
+            const cCache = parseFloat(modalHtml.find("#gcost_modal_cache_base").val());
+            const cOut = parseFloat(modalHtml.find("#gcost_modal_out_base").val());
             patch.preset = "custom";
+            patch.customName = cName;
+            if (!isNaN(cIn) && cIn >= 0) { patch.inBase = cIn; patch.inHigh = cIn; }
+            if (!isNaN(cCache) && cCache >= 0) { patch.cacheBase = cCache; patch.cacheHigh = cCache; }
+            if (!isNaN(cOut) && cOut >= 0) { patch.outBase = cOut; patch.outHigh = cOut; }
         }
 
         updateSettings(patch);
@@ -2495,6 +2584,7 @@ jQuery(async () => {
         eventSource.on(event_types.MESSAGE_SWIPED, () => setTimeout(renderAllBadges, 100));
 
         renderAllBadges();
+        resolveErrorCode("GCOST-INIT");
         console.log(`[Gemini Cost Calculator v${EXT_VERSION}] 로드 완료`);
     } catch (err) {
         recordErrorLog("GCOST-INIT", "확장 초기화", err);

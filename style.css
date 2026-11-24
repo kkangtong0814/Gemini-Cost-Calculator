@@ -616,6 +616,20 @@
     gap: 10px;
 }
 
+.gcost-mset-grid3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+}
+
+.gcost-mset-custom-box {
+    background: #ffffff;
+    border: 1px dashed #cbd5e1;
+    border-radius: 8px;
+    padding: 9px 10px;
+    margin-bottom: 10px;
+}
+
 .gcost-mset-hint {
     font-size: 10.5px;
     color: #64748b;
