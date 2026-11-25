@@ -1,7 +1,7 @@
 <div id="gemini_cost_settings">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>Gemini 비용 계산기 (v2.1.1)</b>
+            <b>Gemini 비용 계산기 (v2.2.0)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -33,14 +33,21 @@
             <div class="gcost-row">
                 <label class="checkbox_label">
                     <input id="gcost_enabled" type="checkbox" />
-                    <span>비용 계산 및 말풍선 배지 표시 활성화</span>
+                    <span>비용 계산 확장 활성화</span>
+                </label>
+            </div>
+
+            <div class="gcost-row">
+                <label class="checkbox_label">
+                    <input id="gcost_show_badges" type="checkbox" />
+                    <span>말풍선 하단 비용 배지 표시 (꺼도 비용 추적·지갑 차감 유지)</span>
                 </label>
             </div>
 
             <div class="gcost-row">
                 <label class="checkbox_label">
                     <input id="gcost_intercept_fetch" type="checkbox" />
-                    <span>네트워크 자동 추적 (독립 확장·외부 API·요약·번역 자동 감지)</span>
+                    <span>네트워크 자동 추적 (요약 · 번역 · 타 확장 채팅 API 호출 자동 감지)</span>
                 </label>
             </div>
 

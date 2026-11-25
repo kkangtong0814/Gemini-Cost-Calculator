@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "2.1.1";
+const EXT_VERSION = "2.2.0";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -65,6 +65,7 @@ const PRESETS = {
 
 const DEFAULT_SETTINGS = {
     enabled: true,
+    showBadges: true,
     interceptFetch: true,
     autoModelPricing: true,
     preset: "gemini-4-carbon-promo",
@@ -677,6 +678,14 @@ function calcTurnCostUsd(normalInput, cacheTokens, outTokens, thinkTokens, total
 /**
  * 일별·월별 통계 기록 (카테고리별 + 모델별 + 호출 출처별 분리 집계)
  */
+function getCurrentChatId() {
+    try {
+        const ctx = window.SillyTavern?.getContext?.() || {};
+        if (ctx.chatId) return String(ctx.chatId);
+    } catch { /* ignore */ }
+    return "";
+}
+
 function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, costUsd, costKrw, savedUsd = 0, savedKrw = 0, normalInput, cacheTokens, outTokens, thinkTokens, isEstimated, exchangeRate }) {
     const stats = loadDailyStats();
     const today = getTodayKey();
@@ -726,6 +735,7 @@ function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, c
         ts: Date.now(),
         date: today,
         time: getTimeStr(),
+        chatId: category === "main" ? getCurrentChatId() : "",
         category,
         caller: caller || category,
         callerLabel: cKey,
@@ -1188,9 +1198,11 @@ function classifyCall(url, reqBody, caller) {
 
     // 방금 메인 채팅 전송(CHAT_COMPLETION_PROMPT_READY)이 발생한 직후의 ST 백엔드 생성 요청은
     // QR/단축키/편의 확장을 거쳐 트리거되었더라도 본 채팅 요청이므로 메인으로 정확히 분류 (중복 집계 방지)
+    // 1회 매칭 후 lastMainPromptAt을 소비(0)하여 직후 1~2초 내 실행되는 자동 번역·요약 확장 오분류를 차단
     const isRecentMain = (Date.now() - lastMainPromptAt) < 4000;
     const isStBackend = u.includes("/api/backends/");
     if (isRecentMain && isStBackend && !u.includes("translate")) {
+        lastMainPromptAt = 0;
         return { category: "main", caller: "main", callerLabel: "메인 채팅" };
     }
 
@@ -2431,6 +2443,8 @@ function buildCacheAnalysisHtml() {
     for (let i = 0; i < eligibleLogs.length - 1; i++) {
         const cur = eligibleLogs[i];
         const prev = eligibleLogs[i + 1];
+        // 서로 다른 채팅방으로 이동한 경우(둘 다 chatId가 있고 서로 다르면) 연속 캐시 간격 집계에서 제외
+        if (cur.chatId && prev.chatId && cur.chatId !== prev.chatId) continue;
         const curTs = getLogTimestamp(cur);
         const prevTs = getLogTimestamp(prev);
         if (!curTs || !prevTs || curTs < prevTs) continue;
@@ -2824,6 +2838,151 @@ function openDiagnosticModal() {
     });
 }
 
+/**
+ * [v2.2.0] 확장 설정 서브 모달 (말풍선 배지 표시 ON/OFF · 표시 형식 · 추적 옵션 · 초기화)
+ */
+function openExtensionSettingsModal(onChanged) {
+    $(".gcost-extset-overlay").remove();
+    const s = getSettings();
+
+    const extModal = $(`
+        <div class="gcost-modal-overlay gcost-diag-overlay gcost-extset-overlay">
+            <div class="gcost-modal gcost-diag-modal">
+                <div class="gcost-modal-header">
+                    <div class="gcost-modal-title-wrap">
+                        <h3>확장 설정</h3>
+                        <span class="gcost-pill-tag">v${EXT_VERSION}</span>
+                    </div>
+                    <span class="gcost-modal-close gcost-extset-close" title="닫기">✕</span>
+                </div>
+                <div class="gcost-modal-body">
+                    <div class="gcost-tab-desc">확장 활성화 여부와 말풍선 비용 배지 표시를 설정해요.</div>
+
+                    <div class="gcost-mset-group">
+                        <div class="gcost-extset-toggle-row">
+                            <div>
+                                <div class="gcost-extset-title">비용 계산 확장 활성화</div>
+                                <div class="gcost-extset-sub">확장 전체의 추적 및 배지 기능을 켜거나 끕니다.</div>
+                            </div>
+                            <input id="gcost_ext_enabled" type="checkbox" class="gcost-extset-chk" ${s.enabled ? "checked" : ""} />
+                        </div>
+                    </div>
+
+                    <div class="gcost-mset-group">
+                        <div class="gcost-extset-toggle-row">
+                            <div>
+                                <div class="gcost-extset-title">말풍선 하단 비용 배지 표시</div>
+                                <div class="gcost-extset-sub">꺼도 백그라운드 비용 계산과 지갑 차감은 계속 동작해요.</div>
+                            </div>
+                            <input id="gcost_ext_show_badges" type="checkbox" class="gcost-extset-chk" ${s.showBadges !== false ? "checked" : ""} />
+                        </div>
+
+                        <div class="gcost-extset-toggle-row">
+                            <div class="gcost-extset-title">배지 표시 형식</div>
+                            <div class="gcost-extset-unit-checks">
+                                <label class="gcost-extset-unit-item">
+                                    <input id="gcost_ext_unit_krw" type="checkbox" class="gcost-extset-chk" ${s.displayMode !== "usd" ? "checked" : ""} />
+                                    <span>원화</span>
+                                </label>
+                                <label class="gcost-extset-unit-item">
+                                    <input id="gcost_ext_unit_usd" type="checkbox" class="gcost-extset-chk" ${s.displayMode !== "krw" ? "checked" : ""} />
+                                    <span>달러</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="gcost-extset-danger-row">
+                        <button type="button" id="gcost_ext_reset_today" class="gcost-btn gcost-btn-xs">오늘 지출 초기화</button>
+                        <button type="button" id="gcost_ext_reset_all" class="gcost-btn gcost-btn-xs">전체 통계 초기화</button>
+                    </div>
+                </div>
+                <div class="gcost-modal-footer">
+                    <button type="button" id="gcost_extset_close_btn" class="gcost-btn gcost-btn-primary">완료</button>
+                </div>
+            </div>
+        </div>
+    `);
+
+    $("body").append(extModal);
+
+    const closeExt = () => extModal.remove();
+    let extOverlayMouseDown = false;
+    extModal.find(".gcost-extset-close, #gcost_extset_close_btn").on("click", closeExt);
+    extModal.on("mousedown", function (e) {
+        extOverlayMouseDown = $(e.target).hasClass("gcost-extset-overlay");
+    });
+    extModal.on("click", function (e) {
+        if (extOverlayMouseDown && $(e.target).hasClass("gcost-extset-overlay")) closeExt();
+        extOverlayMouseDown = false;
+    });
+
+    const syncDrawerToggles = (cfg) => {
+        $("#gcost_enabled").prop("checked", cfg.enabled);
+        $("#gcost_show_badges").prop("checked", cfg.showBadges !== false);
+        $("#gcost_intercept_fetch").prop("checked", cfg.interceptFetch);
+        $("#gcost_auto_model_pricing").prop("checked", cfg.autoModelPricing);
+        $("#gcost_auto_cache").prop("checked", cfg.autoCache);
+        $("#gcost_display_mode").val(cfg.displayMode);
+    };
+
+    extModal.find("#gcost_ext_show_badges").on("change", function () {
+        const checked = $(this).is(":checked");
+        updateSettings({ showBadges: checked });
+        syncDrawerToggles(getSettings());
+        renderAllBadges();
+        if (window.toastr) toastr.info(checked ? "말풍선 비용 배지를 표시합니다." : "말풍선 비용 배지를 숨겼습니다. (비용 추적은 계속 동작)");
+    });
+
+    const applyDisplayUnitChecks = (changedEl) => {
+        const $krw = extModal.find("#gcost_ext_unit_krw");
+        const $usd = extModal.find("#gcost_ext_unit_usd");
+        let useKrw = $krw.is(":checked");
+        let useUsd = $usd.is(":checked");
+        if (!useKrw && !useUsd) {
+            $(changedEl).prop("checked", true);
+            useKrw = $krw.is(":checked");
+            useUsd = $usd.is(":checked");
+            if (window.toastr) toastr.info("원화 또는 달러 중 최소 하나는 선택되어 있어야 해요.");
+        }
+        const mode = (useKrw && useUsd) ? "both" : (useKrw ? "krw" : "usd");
+        updateSettings({ displayMode: mode });
+        syncDrawerToggles(getSettings());
+        renderAllBadges();
+    };
+
+    extModal.find("#gcost_ext_unit_krw, #gcost_ext_unit_usd").on("change", function () {
+        applyDisplayUnitChecks(this);
+    });
+
+    extModal.find("#gcost_ext_enabled").on("change", function () {
+        updateSettings({ enabled: $(this).is(":checked") });
+        syncDrawerToggles(getSettings());
+        renderAllBadges();
+    });
+
+    extModal.find("#gcost_ext_reset_today").on("click", () => {
+        if (!confirm("오늘의 지출 기록을 초기화할까요?")) return;
+        const stats = loadDailyStats();
+        delete stats[getTodayKey()];
+        saveDailyStats(stats);
+        notifiedBudgetFlags.clear();
+        renderStatsUI();
+        if (typeof onChanged === "function") onChanged();
+        if (window.toastr) toastr.info("오늘 지출 기록을 초기화했습니다.");
+    });
+
+    extModal.find("#gcost_ext_reset_all").on("click", () => {
+        if (!confirm("모든 날짜의 지출 기록과 호출 로그를 완전히 삭제할까요? (등록된 크레딧 지갑은 유지됩니다)")) return;
+        localStorage.removeItem(STATS_STORAGE_KEY);
+        localStorage.removeItem(RECENT_LOGS_KEY);
+        notifiedBudgetFlags.clear();
+        renderStatsUI();
+        if (typeof onChanged === "function") onChanged();
+        if (window.toastr) toastr.info("전체 지출 기록과 로그를 초기화했습니다.");
+    });
+}
+
 function renderCombinedModal(settings, result, defaultTab, upToIndex = null, basePromptInfo = null, cacheRateInfo = null) {
     $(".gcost-modal-overlay").remove();
 
@@ -3004,6 +3163,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                     </div>
                     <div class="gcost-modal-header-right">
                         <button type="button" id="gcost_open_diag_btn" class="${diagBtnClass}" title="확장 오류 상태 확인 및 제보 리포트 복사">${diagBtnLabel}</button>
+                        <button type="button" id="gcost_open_extset_btn" class="gcost-gear-btn" title="확장 설정 (배지 표시 · 추적 옵션)" aria-label="확장 설정"><i class="fa-solid fa-gear"></i></button>
                         <span class="gcost-modal-close" title="닫기">✕</span>
                     </div>
                 </div>
@@ -3012,7 +3172,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                     <button type="button" class="gcost-tab-btn ${isChatTab ? "active" : ""}" data-tab="chat">현재 채팅</button>
                     <button type="button" class="gcost-tab-btn ${isLiveTab ? "active" : ""}" data-tab="live">전체 내역</button>
                     <button type="button" class="gcost-tab-btn ${isCacheTab ? "active" : ""}" data-tab="cache">캐싱 분석</button>
-                    <button type="button" class="gcost-tab-btn ${isSetTab ? "active" : ""}" data-tab="settings">설정</button>
+                    <button type="button" class="gcost-tab-btn ${isSetTab ? "active" : ""}" data-tab="settings">비용 설정</button>
                 </div>
 
                 <div class="gcost-modal-body">
@@ -3428,8 +3588,9 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         const nextList = (cur.customPresets || []).filter(c => c.id !== delId);
         const patch = { customPresets: nextList };
         if (cur.preset === delId) {
-            const { label, shortLabel, ...pricing } = PRESETS["gemini-4-carbon-promo"];
-            Object.assign(patch, { preset: "gemini-4-carbon-promo", ...pricing });
+            const defKey = getDefaultPresetKey();
+            const { label, shortLabel, ...pricing } = PRESETS[defKey];
+            Object.assign(patch, { preset: defKey, ...pricing });
         }
         updateSettings(patch);
         syncDrawerPresetOptions(getSettings());
@@ -3504,6 +3665,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     const closeModal = () => modalHtml.remove();
     let modalOverlayMouseDown = false;
     modalHtml.find("#gcost_open_diag_btn").on("click", () => openDiagnosticModal());
+    modalHtml.find("#gcost_open_extset_btn").on("click", () => openExtensionSettingsModal(() => refreshLiveAndCachePanels()));
     modalHtml.find(".gcost-modal-close, #gcost_close_modal_btn").on("click", closeModal);
     modalHtml.on("mousedown", function (e) {
         modalOverlayMouseDown = $(e.target).hasClass("gcost-modal-overlay");
@@ -3577,7 +3739,7 @@ function renderAllBadges() {
         : false;
 
     $(".gcost-badge").remove();
-    if (!settings.enabled) return;
+    if (!settings.enabled || settings.showBadges === false) return;
 
     let cumulativeUsd = 0;
     let cumulativeKrw = 0;
@@ -3774,6 +3936,7 @@ function bindSettingsUI() {
 
     const syncInputs = (cfg) => {
         $("#gcost_enabled").prop("checked", cfg.enabled);
+        $("#gcost_show_badges").prop("checked", cfg.showBadges !== false);
         $("#gcost_intercept_fetch").prop("checked", cfg.interceptFetch);
         $("#gcost_auto_model_pricing").prop("checked", cfg.autoModelPricing);
         syncDrawerPresetOptions(cfg);
@@ -3802,6 +3965,11 @@ function bindSettingsUI() {
 
     $("#gcost_enabled").on("change", function () {
         updateSettings({ enabled: $(this).is(":checked") });
+        renderAllBadges();
+    });
+
+    $("#gcost_show_badges").on("change", function () {
+        updateSettings({ showBadges: $(this).is(":checked") });
         renderAllBadges();
     });
 
@@ -3889,6 +4057,7 @@ function bindSettingsUI() {
         const stats = loadDailyStats();
         delete stats[getTodayKey()];
         saveDailyStats(stats);
+        notifiedBudgetFlags.clear();
         renderStatsUI();
     });
 
@@ -3896,6 +4065,7 @@ function bindSettingsUI() {
         if (!confirm("모든 날짜의 지출 기록과 호출 로그를 완전히 삭제할까요?")) return;
         localStorage.removeItem(STATS_STORAGE_KEY);
         localStorage.removeItem(RECENT_LOGS_KEY);
+        notifiedBudgetFlags.clear();
         renderStatsUI();
     });
 
@@ -3930,6 +4100,11 @@ jQuery(async () => {
             window.__gcostEscBound = true;
             document.addEventListener("keydown", (e) => {
                 if (e.key !== "Escape") return;
+                const $extSet = $(".gcost-extset-overlay");
+                if ($extSet.length) {
+                    $extSet.remove();
+                    return;
+                }
                 const $diag = $(".gcost-diag-overlay");
                 if ($diag.length) {
                     $diag.remove();
