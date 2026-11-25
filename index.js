@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "2.1.0";
+const EXT_VERSION = "2.1.1";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -100,6 +100,7 @@ const WRAPPER_EXTENSION_FRAMES = [
     { ext: "gemini-cost-calculator" },
     { ext: "blue-lemonade", sub: "/src/addons/perf/" },
     { ext: "ST-QuickActions", sub: "vertex-profile-fix.js" },
+    { ext: "ST-QuickActions", sub: "qr-input.js" },
     { ext: "perf-assist" },
     { ext: "request-log" },
 ];
@@ -1185,6 +1186,14 @@ function classifyCall(url, reqBody, caller) {
         return { category: "main", caller: "main", callerLabel: "메인 채팅" };
     }
 
+    // 방금 메인 채팅 전송(CHAT_COMPLETION_PROMPT_READY)이 발생한 직후의 ST 백엔드 생성 요청은
+    // QR/단축키/편의 확장을 거쳐 트리거되었더라도 본 채팅 요청이므로 메인으로 정확히 분류 (중복 집계 방지)
+    const isRecentMain = (Date.now() - lastMainPromptAt) < 4000;
+    const isStBackend = u.includes("/api/backends/");
+    if (isRecentMain && isStBackend && !u.includes("translate")) {
+        return { category: "main", caller: "main", callerLabel: "메인 채팅" };
+    }
+
     // 프롬프트 샘플 텍스트 (요약/번역 판별용)
     let sampleText = "";
     if (Array.isArray(reqBody?.messages)) {
@@ -1210,12 +1219,6 @@ function classifyCall(url, reqBody, caller) {
     // 스택으로 호출자를 특정하지 못한 경우 기존 휴리스틱 폴백
     if (u.includes("translate")) {
         return { category: "translate", caller: "translate", callerLabel: "번역" };
-    }
-
-    const isRecentMain = (Date.now() - lastMainPromptAt) < 4000;
-    const isStBackend = u.includes("/api/backends/");
-    if (isRecentMain && isStBackend) {
-        return { category: "main", caller: "main", callerLabel: "메인 채팅" };
     }
 
     if (sampleText.includes("summarize") || sampleText.includes("summary") || sampleText.includes("요약")) {
