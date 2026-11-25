@@ -1,5 +1,5 @@
 /* =========================================================
-   Gemini Cost Calculator v2.0.0 - Clean Slate UI + Cache Analytics
+   Gemini Cost Calculator v2.1.0 - Clean Slate UI + Credit Wallets
    ========================================================= */
 
 .gcost-row {
@@ -356,6 +356,16 @@
 
 .gcost-tab-panel.active {
     display: block;
+}
+
+/* 각 탭 상단 회색 한 줄 안내 문구 */
+.gcost-tab-desc {
+    font-size: 11.5px;
+    color: #64748b;
+    line-height: 1.45;
+    margin: 0 0 10px 0;
+    padding: 0 2px;
+    word-break: keep-all;
 }
 
 /* 요약 카드 */
@@ -1244,6 +1254,212 @@
     margin-bottom: 0;
 }
 
+/* [v2.1.0] 크레딧 지갑 (다계정 잔액 차감 관리) */
+.gcost-drawer-wallet-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+    padding: 6px 9px;
+    margin-bottom: 8px;
+    border-radius: 7px;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    font-size: 11px;
+    color: #334155;
+}
+
+.gcost-drawer-wallet-bar.warn {
+    background: #fffbeb;
+    border-color: #fde68a;
+    color: #92400e;
+}
+
+.gcost-drawer-wallet-bar.over {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: #991b1b;
+}
+
+.gcost-wallet-card {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+}
+
+.gcost-wallet-card.warn {
+    background: #fffbeb;
+    border-color: #fde68a;
+}
+
+.gcost-wallet-card.over {
+    background: #fef2f2;
+    border-color: #fecaca;
+}
+
+.gcost-wallet-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
+
+.gcost-wallet-label {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #475569;
+    white-space: nowrap;
+}
+
+.gcost-wallet-select {
+    flex: 1;
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    background: #ffffff;
+    color: #0f172a;
+    font-size: 12px;
+    font-weight: 600;
+    outline: none;
+}
+
+.gcost-wallet-btns {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.gcost-wallet-mid {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+}
+
+.gcost-wallet-bal-wrap {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.gcost-wallet-bal {
+    font-size: 17px;
+    font-weight: 800;
+    color: #0f172a;
+    font-variant-numeric: tabular-nums;
+}
+
+.gcost-wallet-card.over .gcost-wallet-bal {
+    color: #b91c1c;
+}
+
+.gcost-wallet-krw {
+    font-size: 11.5px;
+    color: #64748b;
+    font-weight: 600;
+}
+
+.gcost-wallet-meta {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.gcost-wallet-pill {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: #e2e8f0;
+    color: #334155;
+}
+
+.gcost-wallet-pill-auto {
+    background: #334155;
+    color: #ffffff;
+}
+
+.gcost-wallet-pct {
+    font-size: 11px;
+    font-weight: 600;
+    color: #475569;
+    font-variant-numeric: tabular-nums;
+}
+
+.gcost-wallet-sub {
+    font-size: 11.5px;
+    color: #64748b;
+}
+
+.gcost-wallet-saved-row {
+    display: grid;
+    grid-template-columns: 1fr auto auto auto auto auto;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 6px;
+    border-radius: 7px;
+    background: #f8fafc;
+    border: 1px solid transparent;
+    font-size: 12px;
+}
+
+.gcost-wallet-saved-row.active {
+    background: #f1f5f9;
+    border-color: #cbd5e1;
+}
+
+.gcost-wallet-pick-btn {
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px;
+    min-width: 0;
+    padding: 2px 0 !important;
+    margin: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    color: #0f172a !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    text-align: left !important;
+    cursor: pointer;
+}
+
+.gcost-wallet-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid #94a3b8;
+    background: #ffffff;
+    flex-shrink: 0;
+}
+
+.gcost-wallet-dot.on {
+    border-color: #0f172a;
+    background: #0f172a;
+}
+
+.gcost-wallet-pick-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.gcost-wallet-pick-name small {
+    font-weight: 500;
+    color: #64748b;
+}
+
 /* =========================================================
    모바일 반응형 (좁은 화면 · 터치 환경 최적화)
    ========================================================= */
@@ -1334,6 +1550,39 @@
         grid-template-columns: 36px 50px 42px 1fr 30px 48px;
         gap: 4px;
         font-size: 10.5px;
+    }
+
+    .gcost-wallet-top {
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .gcost-wallet-select {
+        width: 100%;
+        flex: 1 1 100%;
+    }
+
+    .gcost-wallet-saved-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 5px 6px;
+        padding: 6px 8px;
+    }
+
+    .gcost-wallet-pick-btn {
+        flex: 1 1 60%;
+        min-width: 120px;
+    }
+
+    .gcost-custom-add-row {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+    }
+
+    .gcost-custom-add-row .gcost-mset-hint {
+        white-space: normal;
+        width: 100%;
     }
 
     .gcost-modal-footer {

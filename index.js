@@ -3,11 +3,12 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "2.0.0";
+const EXT_VERSION = "2.1.0";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
 const ERROR_LOGS_KEY = "gemini_cost_error_logs_v1";
+const WALLETS_STORAGE_KEY = "gemini_cost_wallets_v1";
 
 // 2026 최신 Gemini 모델별 단가 프리셋 (1M 토큰당 USD)
 const PRESETS = {
@@ -108,7 +109,16 @@ let lastMainPromptAt = 0;
 let lastCapturedMainRecord = null;
 let pendingMainFetchPromise = null;
 const notifiedBudgetFlags = new Set();
+const notifiedWalletFlags = new Set();
 const tokenCountCache = new Map();
+let cachedSecretState = null;
+
+// SillyTavern 다중 API 키 관리(secret_state)에서 키 원문은 절대 읽지 않고 '키 이름(label)'만 안전하게 참조
+import("../../../secrets.js")
+    .then(mod => {
+        if (mod && mod.secret_state) cachedSecretState = mod.secret_state;
+    })
+    .catch(() => { /* 구버전 ST 호환: 미지원 시 무시 */ });
 
 async function getCachedTokenCount(text) {
     const str = String(text || "");
@@ -171,6 +181,230 @@ function loadRecentLogs() {
 
 function saveRecentLogs(logs) {
     localStorage.setItem(RECENT_LOGS_KEY, JSON.stringify(logs.slice(0, 100)));
+}
+
+function loadWallets() {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(WALLETS_STORAGE_KEY));
+        if (parsed && Array.isArray(parsed.items)) {
+            return {
+                activeId: typeof parsed.activeId === "string" ? parsed.activeId : "",
+                paused: Boolean(parsed.paused),
+                items: parsed.items,
+            };
+        }
+    } catch { /* ignore */ }
+    return { activeId: "", paused: false, items: [] };
+}
+
+function saveWallets(data) {
+    try {
+        localStorage.setItem(WALLETS_STORAGE_KEY, JSON.stringify({
+            activeId: data?.activeId || "",
+            paused: Boolean(data?.paused),
+            items: Array.isArray(data?.items) ? data.items : [],
+        }));
+    } catch { /* ignore */ }
+}
+
+/**
+ * SillyTavern Connection Manager 현재 활성 프로필명 조회 (API 키는 절대 읽지 않음)
+ */
+function getActiveConnectionProfileName() {
+    try {
+        const cm = extension_settings?.connectionManager;
+        if (cm && Array.isArray(cm.profiles) && cm.selectedProfile) {
+            const found = cm.profiles.find(p => p && p.id === cm.selectedProfile);
+            if (found?.name) return String(found.name).trim();
+        }
+    } catch { /* ignore */ }
+    return "";
+}
+
+/**
+ * SillyTavern 다중 API 키 관리에서 현재 활성화된 '키 이름(label)' 목록만 안전하게 조회
+ * (API 키 원문은 단 한 글자도 읽거나 저장하지 않음)
+ */
+function getActiveSecretLabels() {
+    const labels = [];
+    try {
+        const state = cachedSecretState;
+        if (!state || typeof state !== "object") return labels;
+
+        const ctx = window.SillyTavern?.getContext?.() || {};
+        const source = String(ctx.chatCompletionSettings?.chat_completion_source || "").toLowerCase();
+        const sourceToSecretKey = {
+            vertexai: "api_key_vertexai",
+            makersuite: "api_key_makersuite",
+            openrouter: "api_key_openrouter",
+            custom: "api_key_custom",
+            openai: "api_key_openai",
+            claude: "api_key_claude",
+            deepseek: "api_key_deepseek",
+            xai: "api_key_xai",
+        };
+
+        const orderedKeys = [];
+        if (sourceToSecretKey[source]) orderedKeys.push(sourceToSecretKey[source]);
+        Object.keys(state).forEach(k => {
+            if (!orderedKeys.includes(k)) orderedKeys.push(k);
+        });
+
+        for (const sKey of orderedKeys) {
+            const arr = state[sKey];
+            if (!Array.isArray(arr)) continue;
+            for (const entry of arr) {
+                if (entry && entry.active === true && typeof entry.label === "string") {
+                    const lbl = entry.label.trim();
+                    if (lbl && !labels.includes(lbl)) labels.push(lbl);
+                }
+            }
+        }
+    } catch { /* ignore */ }
+    return labels;
+}
+
+/**
+ * 지갑에 등록된 쉼표(,) 구분 자동 매칭 이름 목록 파싱
+ */
+function parseWalletMatchNames(raw) {
+    return String(raw || "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean);
+}
+
+/**
+ * 다른 지갑에 이미 등록된 키 이름(라벨) 중복 여부 확인
+ */
+function findDuplicateWalletKeys(walletsData, matchNames, excludeWalletId = "") {
+    const conflicts = [];
+    const items = Array.isArray(walletsData?.items) ? walletsData.items : [];
+    const targetLowers = new Set(matchNames.map(n => n.toLowerCase()));
+    if (targetLowers.size === 0) return conflicts;
+
+    for (const w of items) {
+        if (!w || w.id === excludeWalletId) continue;
+        const wNames = parseWalletMatchNames(w.profileName);
+        for (const wn of wNames) {
+            if (targetLowers.has(wn.toLowerCase())) {
+                conflicts.push({ keyName: wn, walletName: w.name });
+            }
+        }
+    }
+    return conflicts;
+}
+
+/**
+ * 현재 API 호출에 적용할 크레딧 지갑 결정
+ * - 사용자가 명시적으로 '차감 안 함(paused)' 선택 시 자동 매칭도 일시 중지
+ * 1순위: 현재 활성 API 키 이름(label) 매칭
+ * 2순위: 현재 SillyTavern 연결 프로필 이름 매칭
+ * 3순위: 사용자가 선택한 기본 활성 지갑
+ */
+function resolveTargetWalletWithReason(walletsData) {
+    const items = Array.isArray(walletsData?.items) ? walletsData.items : [];
+    if (items.length === 0 || walletsData?.paused) return { wallet: null, matchedBy: "", matchedName: "" };
+
+    // 1. 현재 활성 API 키 이름(label) 매칭 (키 원문 미접근)
+    const activeLabels = getActiveSecretLabels();
+    if (activeLabels.length > 0) {
+        const labelMap = new Map(activeLabels.map(l => [l.toLowerCase(), l]));
+        for (const w of items) {
+            const names = parseWalletMatchNames(w.profileName);
+            for (const n of names) {
+                const hit = labelMap.get(n.toLowerCase());
+                if (hit) return { wallet: w, matchedBy: "keyLabel", matchedName: hit };
+            }
+        }
+    }
+
+    // 2. SillyTavern 연결 프로필 이름 매칭
+    const activeProfile = getActiveConnectionProfileName();
+    if (activeProfile) {
+        const lowerProf = activeProfile.toLowerCase();
+        for (const w of items) {
+            const names = parseWalletMatchNames(w.profileName);
+            if (names.some(n => n.toLowerCase() === lowerProf)) {
+                return { wallet: w, matchedBy: "profile", matchedName: activeProfile };
+            }
+        }
+    }
+
+    // 3. 수동 선택 활성 지갑
+    if (walletsData.activeId) {
+        const byId = items.find(w => w.id === walletsData.activeId);
+        if (byId) return { wallet: byId, matchedBy: "manual", matchedName: "" };
+    }
+    return { wallet: null, matchedBy: "", matchedName: "" };
+}
+
+function resolveTargetWallet(walletsData) {
+    return resolveTargetWalletWithReason(walletsData).wallet;
+}
+
+function formatWalletAmount(amount, currency) {
+    const num = Number(amount) || 0;
+    if (currency === "KRW") {
+        return `${Math.round(num).toLocaleString()}원`;
+    }
+    const sign = num < 0 ? "-" : "";
+    return `${sign}$${Math.abs(num).toFixed(2)}`;
+}
+
+function getWalletDdayLabel(expiresAt) {
+    if (!expiresAt) return "";
+    const target = Date.parse(`${expiresAt}T23:59:59`);
+    if (!Number.isFinite(target)) return "";
+    const diffDays = Math.ceil((target - Date.now()) / (24 * 60 * 60 * 1000));
+    if (diffDays < 0) return "만료됨";
+    if (diffDays === 0) return "D-Day";
+    return `D-${diffDays}`;
+}
+
+function checkWalletAlert(wallet) {
+    if (!wallet || !window.toastr) return;
+    const init = Number(wallet.initialAmount) || 0;
+    const bal = Number(wallet.balance) || 0;
+    const balStr = formatWalletAmount(bal, wallet.currency);
+
+    if (bal <= 0) {
+        const flag0 = `w0:${wallet.id}`;
+        if (!notifiedWalletFlags.has(flag0)) {
+            notifiedWalletFlags.add(flag0);
+            notifiedWalletFlags.add(`w20:${wallet.id}`);
+            toastr.error(`잔액 ${balStr}`, `[${wallet.name}] 크레딧 소진`);
+        }
+    } else if (init > 0 && (bal / init) <= 0.2) {
+        const flag20 = `w20:${wallet.id}`;
+        if (!notifiedWalletFlags.has(flag20)) {
+            notifiedWalletFlags.add(flag20);
+            toastr.warning(`남은 잔액 ${balStr} (${Math.round((bal / init) * 100)}%)`, `[${wallet.name}] 크레딧 부족`);
+        }
+    }
+}
+
+function deductFromWallet(costUsd, costKrw) {
+    const wallets = loadWallets();
+    const target = resolveTargetWallet(wallets);
+    if (!target) return { walletId: "", walletDeducted: 0 };
+
+    const deduct = target.currency === "KRW" ? (Number(costKrw) || 0) : (Number(costUsd) || 0);
+    target.balance = (Number(target.balance) || 0) - deduct;
+    target.updatedAt = Date.now();
+    saveWallets(wallets);
+    checkWalletAlert(target);
+    return { walletId: target.id, walletDeducted: deduct };
+}
+
+function refundToWallet(walletId, amount) {
+    if (!walletId || !amount) return;
+    const wallets = loadWallets();
+    const target = wallets.items.find(w => w.id === walletId);
+    if (!target) return;
+    target.balance = (Number(target.balance) || 0) + (Number(amount) || 0);
+    target.updatedAt = Date.now();
+    saveWallets(wallets);
 }
 
 function loadErrorLogs() {
@@ -482,6 +716,9 @@ function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, c
 
     saveDailyStats(stats);
 
+    // 크레딧 지갑 자동 차감 (활성 지갑 또는 ST 연결 프로필 매칭 지갑)
+    const { walletId, walletDeducted } = deductFromWallet(costUsd, costKrw);
+
     const logs = loadRecentLogs();
     logs.unshift({
         id: `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -497,6 +734,8 @@ function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, c
         costKrw,
         savedUsd: savedUsd || 0,
         savedKrw: savedKrw || 0,
+        walletId,
+        walletDeducted,
         exchangeRate: exchangeRate || getSettings().exchangeRate,
         totalInput: normalInput + cacheTokens,
         cacheTokens,
@@ -564,6 +803,11 @@ function deleteRecentLogByIndex(idx) {
     const [removed] = logs.splice(idx, 1);
     saveRecentLogs(logs);
 
+    // 해당 로그로 차감되었던 크레딧 지갑 잔액 자동 환불
+    if (removed?.walletId && removed?.walletDeducted) {
+        refundToWallet(removed.walletId, removed.walletDeducted);
+    }
+
     if (removed && removed.date) {
         const stats = loadDailyStats();
         const day = stats[removed.date];
@@ -618,6 +862,7 @@ function exportCostData() {
         dailyStats: loadDailyStats(),
         recentLogs: loadRecentLogs(),
         customPresets: Array.isArray(s.customPresets) ? s.customPresets : [],
+        wallets: loadWallets(),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -628,11 +873,11 @@ function exportCostData() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    if (window.toastr) toastr.success("지출 통계·로그·커스텀 프리셋을 JSON 파일로 백업했습니다.");
+    if (window.toastr) toastr.success("지출 통계·로그·프리셋·지갑을 JSON 파일로 백업했습니다.");
 }
 
 /**
- * JSON 파일로부터 통계 & 로그 & 커스텀 프리셋 복원
+ * JSON 파일로부터 통계 & 로그 & 커스텀 프리셋 & 크레딧 지갑 복원
  */
 function triggerImportCostData(onImported) {
     const input = document.createElement("input");
@@ -644,7 +889,7 @@ function triggerImportCostData(onImported) {
         try {
             const text = await file.text();
             const parsed = JSON.parse(text);
-            if (!parsed || typeof parsed !== "object" || (!parsed.dailyStats && !parsed.recentLogs && !parsed.customPresets)) {
+            if (!parsed || typeof parsed !== "object" || (!parsed.dailyStats && !parsed.recentLogs && !parsed.customPresets && !parsed.wallets)) {
                 throw new Error("올바른 Gemini 비용 계산기 백업 파일이 아닙니다.");
             }
             if (parsed.dailyStats && typeof parsed.dailyStats === "object") {
@@ -670,9 +915,28 @@ function triggerImportCostData(onImported) {
                     syncDrawerPresetOptions(getSettings());
                 }
             }
+            let restoredWalletCount = 0;
+            if (parsed.wallets && Array.isArray(parsed.wallets.items) && parsed.wallets.items.length > 0) {
+                const curW = loadWallets();
+                const existingIds = new Set(curW.items.map(w => w.id));
+                parsed.wallets.items.forEach(w => {
+                    if (w && w.id && w.name && !existingIds.has(w.id)) {
+                        curW.items.push(w);
+                        existingIds.add(w.id);
+                        restoredWalletCount += 1;
+                    }
+                });
+                if (!curW.activeId && parsed.wallets.activeId) {
+                    curW.activeId = parsed.wallets.activeId;
+                }
+                if (restoredWalletCount > 0) saveWallets(curW);
+            }
             renderStatsUI();
             resolveErrorCode("GCOST-IMPORT");
-            const extraMsg = restoredPresetCount > 0 ? ` (커스텀 프리셋 ${restoredPresetCount}개 포함)` : "";
+            const extras = [];
+            if (restoredPresetCount > 0) extras.push(`프리셋 ${restoredPresetCount}개`);
+            if (restoredWalletCount > 0) extras.push(`지갑 ${restoredWalletCount}개`);
+            const extraMsg = extras.length > 0 ? ` (${extras.join(" · ")} 포함)` : "";
             if (window.toastr) toastr.success(`백업 파일에서 지출 통계를 복원했습니다.${extraMsg}`);
             if (typeof onImported === "function") onImported();
         } catch (err) {
@@ -707,6 +971,30 @@ function renderStatsUI() {
 
     $("#gcost_stat_month").text(`${Math.round(monthKrw).toLocaleString()}원`);
     $("#gcost_stat_month_sub").text(`메인 ${Math.round(monthMainKrw).toLocaleString()}원 · 부가 ${Math.round(monthAuxKrw).toLocaleString()}원`);
+
+    // 확장 설정 서랍 미니 크레딧 잔액 바 갱신 (등록된 지갑이 있을 때만 표시)
+    const $wBar = $("#gcost_drawer_wallet_bar");
+    if ($wBar.length) {
+        const wallets = loadWallets();
+        const target = resolveTargetWallet(wallets);
+        if (target) {
+            const s = getSettings();
+            const balStr = formatWalletAmount(target.balance, target.currency);
+            const krwHint = target.currency === "USD"
+                ? ` (약 ${Math.round((Number(target.balance) || 0) * s.exchangeRate).toLocaleString()}원)`
+                : "";
+            const dday = getWalletDdayLabel(target.expiresAt);
+            const ddayStr = dday ? ` · ${dday}` : "";
+            const init = Number(target.initialAmount) || 0;
+            const bal = Number(target.balance) || 0;
+            $wBar.removeClass("warn over");
+            if (bal <= 0) $wBar.addClass("over");
+            else if (init > 0 && (bal / init) <= 0.2) $wBar.addClass("warn");
+            $wBar.html(`<span><strong>${escapeHtml(target.name)}</strong>${escapeHtml(ddayStr)}</span><span>잔액 <strong>${escapeHtml(balStr)}</strong>${escapeHtml(krwHint)}</span>`).show();
+        } else {
+            $wBar.hide();
+        }
+    }
 }
 
 /**
@@ -1669,6 +1957,75 @@ function getDateKeyOffset(daysAgo) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+function buildWalletCardHtml(settings) {
+    const wallets = loadWallets();
+    if (!wallets.items.length) return "";
+
+    const { wallet: current, matchedBy, matchedName } = resolveTargetWalletWithReason(wallets);
+
+    const optionsHtml = `<option value="" ${!current ? "selected" : ""}>차감 안 함 (선택 해제)</option>`
+        + wallets.items.map(w => {
+            const sel = current && current.id === w.id ? "selected" : "";
+            const balShort = formatWalletAmount(w.balance, w.currency);
+            return `<option value="${escapeHtml(w.id)}" ${sel}>${escapeHtml(w.name)} (${balShort})</option>`;
+        }).join("");
+
+    if (!current) {
+        return `
+            <div class="gcost-wallet-card">
+                <div class="gcost-wallet-top">
+                    <span class="gcost-wallet-label">크레딧 지갑</span>
+                    <select id="gcost_live_wallet_select" class="gcost-wallet-select">${optionsHtml}</select>
+                </div>
+                <div class="gcost-wallet-sub">현재 자동 차감이 꺼져 있어요. 위에서 계정을 선택하면 통장처럼 자동 차감됩니다.</div>
+            </div>
+        `;
+    }
+
+    const bal = Number(current.balance) || 0;
+    const init = Number(current.initialAmount) || 0;
+    const pctRaw = init > 0 ? Math.round((bal / init) * 100) : 0;
+    const pctClamped = Math.max(0, Math.min(100, pctRaw));
+    const stateClass = bal <= 0 ? "over" : (init > 0 && (bal / init) <= 0.2 ? "warn" : "");
+    const balStr = formatWalletAmount(bal, current.currency);
+    const initStr = init > 0 ? formatWalletAmount(init, current.currency) : "";
+    const krwSub = current.currency === "USD"
+        ? `약 ${Math.round(bal * settings.exchangeRate).toLocaleString()}원`
+        : "";
+    const dday = getWalletDdayLabel(current.expiresAt);
+    const ddayTag = dday ? `<span class="gcost-wallet-pill">${escapeHtml(dday)}</span>` : "";
+    let autoTag = "";
+    if (matchedBy === "keyLabel") {
+        autoTag = `<span class="gcost-wallet-pill gcost-wallet-pill-auto" title="활성 API 키 이름(${escapeHtml(matchedName)})과 자동 매칭됨 (키 원문 미수집)">키 이름: ${escapeHtml(matchedName)}</span>`;
+    } else if (matchedBy === "profile") {
+        autoTag = `<span class="gcost-wallet-pill gcost-wallet-pill-auto" title="SillyTavern 연결 프로필(${escapeHtml(matchedName)})과 자동 매칭됨">프로필: ${escapeHtml(matchedName)}</span>`;
+    }
+
+    return `
+        <div class="gcost-wallet-card ${stateClass}">
+            <div class="gcost-wallet-top">
+                <select id="gcost_live_wallet_select" class="gcost-wallet-select" title="활성 크레딧 지갑 전환">${optionsHtml}</select>
+                <div class="gcost-wallet-btns">
+                    <button type="button" class="gcost-inline-auto-btn gcost-wallet-topup-btn" data-wallet-id="${escapeHtml(current.id)}">+ 충전</button>
+                    <button type="button" class="gcost-inline-auto-btn gcost-wallet-sync-btn" data-wallet-id="${escapeHtml(current.id)}">보정</button>
+                </div>
+            </div>
+            <div class="gcost-wallet-mid">
+                <div class="gcost-wallet-bal-wrap">
+                    <strong class="gcost-wallet-bal">${escapeHtml(balStr)}</strong>
+                    ${krwSub ? `<span class="gcost-wallet-krw">${escapeHtml(krwSub)}</span>` : ""}
+                </div>
+                <div class="gcost-wallet-meta">
+                    ${autoTag}
+                    ${ddayTag}
+                    ${init > 0 ? `<span class="gcost-wallet-pct">${pctRaw}% (${escapeHtml(initStr)})</span>` : ""}
+                </div>
+            </div>
+            ${init > 0 ? `<div class="gcost-progress-track"><div class="gcost-progress-fill ${stateClass}" style="width:${pctClamped}%"></div></div>` : ""}
+        </div>
+    `;
+}
+
 function buildLiveStatsHtml(logFilter = "all", logLimit = 8) {
     const settings = getSettings();
     const stats = loadDailyStats();
@@ -1810,31 +2167,46 @@ function buildLiveStatsHtml(logFilter = "all", logLimit = 8) {
         `;
     }
 
-    // 3. 최근 7일 일자별 지출 (접이식으로 컴팩트 유지)
-    const last7Rows = [];
-    let last7Total = 0;
-    for (let i = 0; i < 7; i++) {
-        const dk = getDateKeyOffset(i);
+    // 3. 일자별 지출 (이번 달 기록된 전체 날짜 + 최근 7일, 접이식으로 컴팩트 유지)
+    const dailyKeySet = new Set();
+    for (let i = 0; i < 7; i++) dailyKeySet.add(getDateKeyOffset(i));
+    Object.keys(stats).forEach(dk => {
+        if (dk.startsWith(monthPrefix)) dailyKeySet.add(dk);
+    });
+    const sortedDailyKeys = [...dailyKeySet].sort((a, b) => (a < b ? 1 : -1));
+    const todayDk = getTodayKey();
+    const yesterdayDk = getDateKeyOffset(1);
+
+    let activeDaysInMonth = 0;
+    const dailyRows = sortedDailyKeys.map(dk => {
         const d = stats[dk];
         const krw = d?.krw || 0;
         const calls = d?.turns || 0;
-        last7Total += krw;
-        const dayTag = i === 0 ? "오늘" : (i === 1 ? "어제" : dk.slice(5));
-        last7Rows.push(`
-            <div class="gcost-compare-row">
+        if (dk.startsWith(monthPrefix) && calls > 0) activeDaysInMonth += 1;
+        const dayTag = dk === todayDk ? "오늘" : (dk === yesterdayDk ? "어제" : dk.slice(5));
+        const mainK = d?.byCategory?.main?.krw || 0;
+        const auxK = Math.max(0, krw - mainK);
+        const dayTip = calls > 0
+            ? `${dk} · 총 ${calls}회 (메인 ${Math.round(mainK).toLocaleString()}원 / 부가 ${Math.round(auxK).toLocaleString()}원)`
+            : `${dk} · 기록 없음`;
+        return `
+            <div class="gcost-compare-row" title="${escapeHtml(dayTip)}">
                 <span class="gcost-model-name">${dayTag} <span class="gcost-compare-note">(${dk})</span></span>
                 <span class="gcost-model-usd">${calls}회</span>
                 <span class="gcost-model-krw">${Math.round(krw).toLocaleString()}원</span>
             </div>
-        `);
-    }
+        `;
+    });
+    const dailySummaryNote = activeDaysInMonth > 0
+        ? `이번 달 ${activeDaysInMonth}일 기록 · ${Math.round(monthTotalKrw).toLocaleString()}원`
+        : `이번 달 기록 없음`;
     const last7Html = `
         <details class="gcost-details">
             <summary class="gcost-details-summary">
-                <span>최근 7일 일자별 지출</span>
-                <span class="gcost-compare-note">7일 합계 ${Math.round(last7Total).toLocaleString()}원</span>
+                <span>일자별 전체 지출 (최근 7일 · 이번 달)</span>
+                <span class="gcost-compare-note">${dailySummaryNote}</span>
             </summary>
-            <div class="gcost-compare-list" style="margin-top:4px;">${last7Rows.join("")}</div>
+            <div class="gcost-compare-list" style="margin-top:4px;">${dailyRows.join("")}</div>
         </details>
     `;
 
@@ -1952,7 +2324,11 @@ function buildLiveStatsHtml(logFilter = "all", logLimit = 8) {
         ? ` · 지난달 ${Math.round(prevMonthTotalKrw).toLocaleString()}원`
         : "";
 
+    const walletCardHtml = buildWalletCardHtml(settings);
+
     return `
+        ${walletCardHtml}
+
         <div class="gcost-summary-cards">
             <div class="gcost-card">
                 <div class="gcost-card-title">이번 달 메인 채팅</div>
@@ -2194,7 +2570,85 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
     const autoCacheDetail = cacheRateInfo?.detail || (settings.autoCacheRate ? "실측 대기 (기본값)" : "수동 설정값");
     const autoCacheHint = `현재 기준: ${escapeHtml(autoCacheDetail)}`;
 
+    const wallets = loadWallets();
+    const activeProfileName = getActiveConnectionProfileName();
+    const activeSecretLabels = getActiveSecretLabels();
+    const hasAutoDetectTarget = Boolean(activeProfileName || activeSecretLabels.length > 0);
+    const savedWalletsHtml = wallets.items.length > 0 ? `
+        <div class="gcost-custom-saved-list" style="margin-bottom:8px;">
+            <div class="gcost-custom-saved-title">등록된 크레딧 지갑 (${wallets.items.length}) · 클릭해 활성 전환</div>
+            ${wallets.items.map(w => {
+                const isActive = wallets.activeId === w.id;
+                const balStr = formatWalletAmount(w.balance, w.currency);
+                const dday = getWalletDdayLabel(w.expiresAt);
+                const subTags = [
+                    w.profileName ? `매칭:${w.profileName}` : "",
+                    dday,
+                ].filter(Boolean).join(" · ");
+                return `
+                    <div class="gcost-wallet-saved-row ${isActive ? "active" : ""}">
+                        <button type="button" class="gcost-wallet-pick-btn" data-wallet-id="${escapeHtml(w.id)}" title="이 지갑을 기본 활성 지갑으로 선택">
+                            <span class="gcost-wallet-dot ${isActive ? "on" : ""}"></span>
+                            <span class="gcost-wallet-pick-name">${escapeHtml(w.name)}${subTags ? ` <small>(${escapeHtml(subTags)})</small>` : ""}</span>
+                        </button>
+                        <span class="gcost-custom-saved-price">${escapeHtml(balStr)}</span>
+                        <button type="button" class="gcost-inline-auto-btn gcost-wallet-keys-btn" data-wallet-id="${escapeHtml(w.id)}" title="이 지갑에 연결할 API 키 이름(쉼표 구분) 수정">키</button>
+                        <button type="button" class="gcost-inline-auto-btn gcost-wallet-topup-btn" data-wallet-id="${escapeHtml(w.id)}" title="크레딧 추가 충전">+충전</button>
+                        <button type="button" class="gcost-inline-auto-btn gcost-wallet-sync-btn" data-wallet-id="${escapeHtml(w.id)}" title="실제 콘솔 잔액과 맞추기">보정</button>
+                        <button type="button" class="gcost-log-del-btn gcost-wallet-del-btn" data-wallet-id="${escapeHtml(w.id)}" title="이 지갑 삭제">×</button>
+                    </div>
+                `;
+            }).join("")}
+        </div>
+    ` : "";
+
     return `
+        <div class="gcost-mset-group">
+            <div class="gcost-mset-row">
+                <label class="gcost-mset-label">
+                    <span>크레딧 지갑 (다계정 잔액 차감)</span>
+                    <button type="button" id="gcost_w_toggle_form_btn" class="gcost-inline-auto-btn active">+ 지갑 추가하기</button>
+                </label>
+                ${savedWalletsHtml}
+                <div id="gcost_w_add_form" class="gcost-mset-custom-box" style="display:none;margin-bottom:0;">
+                    <div class="gcost-mset-grid3">
+                        <div class="gcost-mset-row">
+                            <label class="gcost-mset-label" for="gcost_w_name">계정 이름</label>
+                            <input id="gcost_w_name" type="text" maxlength="24" class="gcost-mset-input" placeholder="예: 버텍스 본계정" />
+                        </div>
+                        <div class="gcost-mset-row">
+                            <label class="gcost-mset-label" for="gcost_w_currency">통화</label>
+                            <select id="gcost_w_currency" class="gcost-mset-select">
+                                <option value="USD">달러 (USD $)</option>
+                                <option value="KRW">원화 (KRW 원)</option>
+                            </select>
+                        </div>
+                        <div class="gcost-mset-row">
+                            <label class="gcost-mset-label" for="gcost_w_amount">초기 잔액</label>
+                            <input id="gcost_w_amount" type="number" step="0.01" min="0" class="gcost-mset-input" placeholder="예: 300" />
+                        </div>
+                    </div>
+                    <div class="gcost-mset-grid2" style="margin-top:8px;">
+                        <div class="gcost-mset-row">
+                            <label class="gcost-mset-label" for="gcost_w_expires">만료일 (선택)</label>
+                            <input id="gcost_w_expires" type="date" class="gcost-mset-input" />
+                        </div>
+                        <div class="gcost-mset-row">
+                            <label class="gcost-mset-label" for="gcost_w_profile">
+                                <span>API 키 이름 매칭</span>
+                                ${hasAutoDetectTarget ? `<button type="button" id="gcost_w_fill_profile" class="gcost-inline-auto-btn" title="현재 켜져 있는 API 키 이름 추가 (키 원문 미수집)">현재 키 추가</button>` : ""}
+                            </label>
+                            <input id="gcost_w_profile" type="text" maxlength="120" class="gcost-mset-input" placeholder="예: 버텍스1, 보조키 (쉼표 구분)" />
+                        </div>
+                    </div>
+                    <div class="gcost-custom-add-row">
+                        <span class="gcost-mset-hint">API 키 원문은 읽지 않고 키 이름(라벨)만 매칭해 자동 차감합니다</span>
+                        <button type="button" id="gcost_w_add_btn" class="gcost-btn gcost-btn-primary gcost-btn-xs">+ 지갑 추가</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div class="gcost-mset-group">
             <div class="gcost-mset-row">
                 <label class="gcost-mset-label" for="gcost_modal_exchange_rate">
@@ -2553,16 +3007,28 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
 
                 <div class="gcost-tabs">
                     <button type="button" class="gcost-tab-btn ${isChatTab ? "active" : ""}" data-tab="chat">현재 채팅</button>
-                    <button type="button" class="gcost-tab-btn ${isLiveTab ? "active" : ""}" data-tab="live">모델·부가</button>
+                    <button type="button" class="gcost-tab-btn ${isLiveTab ? "active" : ""}" data-tab="live">전체 내역</button>
                     <button type="button" class="gcost-tab-btn ${isCacheTab ? "active" : ""}" data-tab="cache">캐싱 분석</button>
                     <button type="button" class="gcost-tab-btn ${isSetTab ? "active" : ""}" data-tab="settings">설정</button>
                 </div>
 
                 <div class="gcost-modal-body">
-                    <div class="gcost-tab-panel ${isChatTab ? "active" : ""}" data-panel="chat">${chatTabHtml}</div>
-                    <div class="gcost-tab-panel ${isLiveTab ? "active" : ""}" data-panel="live">${liveTabHtml}</div>
-                    <div class="gcost-tab-panel ${isCacheTab ? "active" : ""}" data-panel="cache">${cacheTabHtml}</div>
-                    <div class="gcost-tab-panel ${isSetTab ? "active" : ""}" data-panel="settings">${settingsTabHtml}</div>
+                    <div class="gcost-tab-panel ${isChatTab ? "active" : ""}" data-panel="chat">
+                        <div class="gcost-tab-desc">지금 열려 있는 이 채팅방의 예상·실측 비용과 모델별 비교를 계산해 드려요.</div>
+                        ${chatTabHtml}
+                    </div>
+                    <div class="gcost-tab-panel ${isLiveTab ? "active" : ""}" data-panel="live">
+                        <div class="gcost-tab-desc">메인 채팅과 모델·확장·부가기능을 포함한 실리태번 전체의 날짜별·월별 지출과 크레딧 잔액을 보여드려요.</div>
+                        <div class="gcost-live-inner">${liveTabHtml}</div>
+                    </div>
+                    <div class="gcost-tab-panel ${isCacheTab ? "active" : ""}" data-panel="cache">
+                        <div class="gcost-tab-desc">실측 메인 호출 기록을 바탕으로 호출 간격별 캐시 적중률과 절약 금액을 분석해 드려요.</div>
+                        <div class="gcost-cache-inner">${cacheTabHtml}</div>
+                    </div>
+                    <div class="gcost-tab-panel ${isSetTab ? "active" : ""}" data-panel="settings">
+                        <div class="gcost-tab-desc">크레딧 지갑, 환율, 모델 단가 프리셋, 예산 알림과 백업·복원을 관리할 수 있어요.</div>
+                        ${settingsTabHtml}
+                    </div>
                 </div>
 
                 <div class="gcost-modal-footer">
@@ -2576,9 +3042,211 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     $("body").append(modalHtml);
 
     const refreshLiveAndCachePanels = () => {
-        modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
-        modalHtml.find('.gcost-tab-panel[data-panel="cache"]').html(buildCacheAnalysisHtml());
+        modalHtml.find(".gcost-live-inner").html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
+        modalHtml.find(".gcost-cache-inner").html(buildCacheAnalysisHtml());
     };
+
+    // [v2.1.0] 크레딧 지갑 이벤트 (탭 2 드롭다운 전환, 충전, 잔액 보정, 탭 4 추가/선택/삭제)
+    modalHtml.on("change", "#gcost_live_wallet_select", function () {
+        const nextId = String($(this).val() || "");
+        const wData = loadWallets();
+        if (!nextId) {
+            wData.activeId = "";
+            wData.paused = true;
+        } else {
+            wData.activeId = nextId;
+            wData.paused = false;
+        }
+        saveWallets(wData);
+        const resolved = resolveTargetWalletWithReason(wData);
+        if (nextId && resolved.wallet && resolved.wallet.id !== nextId && (resolved.matchedBy === "keyLabel" || resolved.matchedBy === "profile")) {
+            if (window.toastr) {
+                toastr.info(`현재 활성 키/프로필(${resolved.matchedName})이 [${resolved.wallet.name}]에 자동 매칭되어 있어요.`);
+            }
+        }
+        renderStatsUI();
+        modalHtml.find(".gcost-live-inner").html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
+    });
+
+    modalHtml.on("click", ".gcost-wallet-pick-btn", function () {
+        const wId = String($(this).data("wallet-id") || "");
+        if (!wId) return;
+        const wData = loadWallets();
+        if (wData.activeId === wId && !wData.paused) {
+            wData.activeId = "";
+            wData.paused = true;
+        } else {
+            wData.activeId = wId;
+            wData.paused = false;
+        }
+        saveWallets(wData);
+        renderStatsUI();
+        openCostModal(upToIndex, "settings");
+    });
+
+    modalHtml.on("click", ".gcost-wallet-topup-btn", function () {
+        const wId = String($(this).data("wallet-id") || "");
+        const wData = loadWallets();
+        const target = wData.items.find(w => w.id === wId);
+        if (!target) return;
+        const unit = target.currency === "KRW" ? "원" : "USD($)";
+        const raw = prompt(`[${target.name}] 추가로 충전할 금액(${unit})을 입력해 주세요.`, "");
+        if (raw === null) return;
+        const add = parseFloat(raw);
+        if (isNaN(add) || add <= 0) {
+            if (window.toastr) toastr.warning("0보다 큰 숫자를 입력해 주세요.");
+            return;
+        }
+        target.balance = (Number(target.balance) || 0) + add;
+        target.initialAmount = Math.max(Number(target.initialAmount) || 0, target.balance);
+        target.updatedAt = Date.now();
+        notifiedWalletFlags.delete(`w0:${target.id}`);
+        notifiedWalletFlags.delete(`w20:${target.id}`);
+        saveWallets(wData);
+        renderStatsUI();
+        const activeTab = modalHtml.find(".gcost-tab-btn.active").data("tab") || "live";
+        if (window.toastr) toastr.success(`[${target.name}] ${formatWalletAmount(add, target.currency)} 충전 완료`);
+        openCostModal(upToIndex, activeTab);
+    });
+
+    modalHtml.on("click", ".gcost-wallet-sync-btn", function () {
+        const wId = String($(this).data("wallet-id") || "");
+        const wData = loadWallets();
+        const target = wData.items.find(w => w.id === wId);
+        if (!target) return;
+        const unit = target.currency === "KRW" ? "원" : "USD($)";
+        const curVal = target.currency === "KRW" ? Math.round(target.balance || 0) : Number((target.balance || 0).toFixed(2));
+        const raw = prompt(`[${target.name}] 현재 실제 잔액(${unit})으로 보정할 금액을 입력해 주세요.`, String(curVal));
+        if (raw === null) return;
+        const nextBal = parseFloat(raw);
+        if (isNaN(nextBal)) {
+            if (window.toastr) toastr.warning("올바른 숫자를 입력해 주세요.");
+            return;
+        }
+        target.balance = nextBal;
+        if (nextBal > (Number(target.initialAmount) || 0)) target.initialAmount = nextBal;
+        target.updatedAt = Date.now();
+        if (nextBal > 0) notifiedWalletFlags.delete(`w0:${target.id}`);
+        saveWallets(wData);
+        renderStatsUI();
+        const activeTab = modalHtml.find(".gcost-tab-btn.active").data("tab") || "live";
+        if (window.toastr) toastr.success(`[${target.name}] 잔액을 ${formatWalletAmount(nextBal, target.currency)}으로 보정했습니다.`);
+        openCostModal(upToIndex, activeTab);
+    });
+
+    modalHtml.on("click", "#gcost_w_toggle_form_btn", function () {
+        const $form = modalHtml.find("#gcost_w_add_form");
+        const isOpen = $form.is(":visible");
+        if (isOpen) {
+            $form.hide();
+            $(this).addClass("active").text("+ 지갑 추가하기");
+        } else {
+            $form.show();
+            $(this).removeClass("active").text("접기");
+        }
+    });
+
+    modalHtml.on("click", "#gcost_w_fill_profile", () => {
+        const $inp = modalHtml.find("#gcost_w_profile");
+        const existing = parseWalletMatchNames($inp.val());
+        const keyLabels = getActiveSecretLabels();
+        // API 키 이름이 있으면 오직 현재 활성 API 키 이름만 깔끔하게 추가 (없을 때만 연결 프로필 폴백)
+        const targetName = keyLabels.length > 0 ? keyLabels[0] : getActiveConnectionProfileName();
+        if (targetName && !existing.some(e => e.toLowerCase() === targetName.toLowerCase())) {
+            existing.push(targetName);
+            $inp.val(existing.join(", "));
+        }
+    });
+
+    modalHtml.on("click", ".gcost-wallet-keys-btn", function () {
+        const wId = String($(this).data("wallet-id") || "");
+        const wData = loadWallets();
+        const target = wData.items.find(w => w.id === wId);
+        if (!target) return;
+        const curKey = getActiveSecretLabels()[0] || "";
+        const hint = curKey ? `\n(현재 활성 API 키 이름: ${curKey})` : "";
+        const raw = prompt(
+            `[${target.name}]에 연결할 API 키 이름을 쉼표(,)로 입력해 주세요.${hint}`,
+            target.profileName || ""
+        );
+        if (raw === null) return;
+        const nextNames = parseWalletMatchNames(raw);
+        const conflicts = findDuplicateWalletKeys(wData, nextNames, target.id);
+        if (conflicts.length > 0) {
+            const detail = conflicts.map(c => `'${c.keyName}' → [${c.walletName}]`).join("\n");
+            const proceed = confirm(
+                `아래 키 이름이 이미 다른 지갑에 연결되어 있어요:\n${detail}\n\n중복 등록 시 목록 위쪽 지갑이 우선 차감됩니다. 그래도 저장할까요?`
+            );
+            if (!proceed) return;
+        }
+        target.profileName = nextNames.join(", ");
+        target.updatedAt = Date.now();
+        saveWallets(wData);
+        renderStatsUI();
+        if (window.toastr) toastr.success(`[${target.name}] 키 이름 매칭을 저장했습니다.`);
+        openCostModal(upToIndex, "settings");
+    });
+
+    modalHtml.on("click", "#gcost_w_add_btn", () => {
+        const name = String(modalHtml.find("#gcost_w_name").val() || "").trim();
+        const currency = modalHtml.find("#gcost_w_currency").val() === "KRW" ? "KRW" : "USD";
+        const amount = parseFloat(modalHtml.find("#gcost_w_amount").val());
+        const expiresAt = String(modalHtml.find("#gcost_w_expires").val() || "").trim();
+        const profileNames = parseWalletMatchNames(modalHtml.find("#gcost_w_profile").val());
+
+        if (!name) {
+            if (window.toastr) toastr.warning("계정(지갑) 이름을 입력해 주세요.");
+            return;
+        }
+        if (isNaN(amount) || amount < 0) {
+            if (window.toastr) toastr.warning("초기 잔액을 0 이상의 숫자로 입력해 주세요.");
+            return;
+        }
+
+        const wData = loadWallets();
+        const conflicts = findDuplicateWalletKeys(wData, profileNames, "");
+        if (conflicts.length > 0) {
+            const detail = conflicts.map(c => `'${c.keyName}' → [${c.walletName}]`).join("\n");
+            const proceed = confirm(
+                `아래 키 이름이 이미 다른 지갑에 연결되어 있어요:\n${detail}\n\n중복 등록 시 목록 위쪽 지갑이 우선 차감됩니다. 그래도 추가할까요?`
+            );
+            if (!proceed) return;
+        }
+
+        const newId = `w_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+        wData.items.push({
+            id: newId,
+            name,
+            currency,
+            initialAmount: amount,
+            balance: amount,
+            expiresAt,
+            profileName: profileNames.join(", "),
+            updatedAt: Date.now(),
+        });
+        wData.activeId = newId;
+        wData.paused = false;
+        saveWallets(wData);
+        renderStatsUI();
+        if (window.toastr) toastr.success(`"${name}" 크레딧 지갑을 추가하고 활성화했습니다.`);
+        openCostModal(upToIndex, "settings");
+    });
+
+    modalHtml.on("click", ".gcost-wallet-del-btn", function () {
+        const wId = String($(this).data("wallet-id") || "");
+        const wData = loadWallets();
+        const target = wData.items.find(w => w.id === wId);
+        if (!target) return;
+        if (!confirm(`"${target.name}" 크레딧 지갑을 삭제할까요?`)) return;
+        wData.items = wData.items.filter(w => w.id !== wId);
+        if (wData.activeId === wId) {
+            wData.activeId = wData.items[0]?.id || "";
+        }
+        saveWallets(wData);
+        renderStatsUI();
+        if (window.toastr) toastr.info(`"${target.name}" 지갑을 삭제했습니다.`);
+        openCostModal(upToIndex, "settings");
+    });
 
     modalHtml.find(".gcost-tab-btn").on("click", function () {
         const target = $(this).data("tab");
@@ -2609,12 +3277,12 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     modalHtml.on("click", ".gcost-filter-chip", function () {
         modalLogFilter = String($(this).data("filter") || "all");
         modalLogLimit = 8;
-        modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
+        modalHtml.find(".gcost-live-inner").html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
     });
 
     modalHtml.on("click", "#gcost_log_more_btn", () => {
         modalLogLimit += 15;
-        modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
+        modalHtml.find(".gcost-live-inner").html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
     });
 
     // 모달 내 설정 탭 이벤트 바인딩
@@ -2770,7 +3438,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     modalHtml.find("#gcost_modal_export_btn").on("click", () => exportCostData());
     modalHtml.find("#gcost_modal_import_btn").on("click", () => {
         triggerImportCostData(() => {
-            refreshLiveAndCachePanels();
+            openCostModal(upToIndex, "settings");
         });
     });
 
