@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "1.1.1";
+const EXT_VERSION = "2.0.0";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -299,15 +299,84 @@ function findPresetByKey(key, settings) {
     return null;
 }
 
+function getDefaultPresetKey() {
+    return getTodayKey() <= "2026-11-30" ? "gemini-4-carbon-promo" : "gemini-4-carbon-std";
+}
+
+/**
+ * 모델별 공식 암묵적 캐싱 최소 토큰 임계값 (Google 공식 문서 기준)
+ * - Gemini 2.5 계열: 2,048 토큰
+ * - Gemini 3.x / Gemini 4 계열: 4,096 토큰
+ */
+function getMinCacheTokens(modelHint = "") {
+    const lower = String(modelHint || "").toLowerCase();
+    if (lower.includes("2.5") || lower.includes("2-5")) return 2048;
+    return 4096;
+}
+
+/**
+ * 캐시 적중으로 절약된 금액(USD/KRW) 계산 (일반 입력 단가 대비 차액)
+ */
+function calcCacheSaved(cacheTokens, totalInput, pricing, exchangeRate) {
+    if (!cacheTokens || cacheTokens <= 0 || !pricing) return { savedUsd: 0, savedKrw: 0 };
+    const isHighTier = totalInput > (pricing.tierThreshold || 200000);
+    const pIn = isHighTier ? (pricing.inHigh ?? pricing.inBase ?? 0) : (pricing.inBase ?? 0);
+    const pCache = isHighTier ? (pricing.cacheHigh ?? pricing.cacheBase ?? 0) : (pricing.cacheBase ?? 0);
+    const diff = Math.max(0, pIn - pCache);
+    const savedUsd = (cacheTokens * diff) / 1_000_000;
+    const savedKrw = savedUsd * (Number(exchangeRate) || 1400);
+    return { savedUsd, savedKrw };
+}
+
+function getLogSavedKrw(log, settings) {
+    if (!log || !log.cacheTokens || log.cacheTokens <= 0) return 0;
+    if (typeof log.savedKrw === "number" && Number.isFinite(log.savedKrw)) return log.savedKrw;
+    const resolved = resolveModelPricing(log.modelLabel || log.modelKey || "", settings);
+    const rate = log.exchangeRate || settings.exchangeRate || 1400;
+    return calcCacheSaved(log.cacheTokens, log.totalInput || 0, resolved.pricing, rate).savedKrw;
+}
+
+function formatElapsedMs(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return "";
+    const sec = Math.round(ms / 1000);
+    if (sec < 60) return `${sec}초`;
+    const min = Math.floor(sec / 60);
+    const remSec = sec % 60;
+    if (min < 60) return remSec > 0 ? `${min}분 ${remSec}초` : `${min}분`;
+    const hr = Math.floor(min / 60);
+    const remMin = min % 60;
+    return remMin > 0 ? `${hr}시간 ${remMin}분` : `${hr}시간`;
+}
+
+/**
+ * 로그의 타임스탬프(ms) 추출 (구버전 로그 호환: ts → id 앞자리 → date+time 폴백)
+ */
+function getLogTimestamp(log) {
+    if (!log) return 0;
+    if (typeof log.ts === "number" && Number.isFinite(log.ts) && log.ts > 0) return log.ts;
+    if (typeof log.id === "string") {
+        const prefix = parseInt(log.id.split("_")[0], 10);
+        if (Number.isFinite(prefix) && prefix > 1_600_000_000_000) return prefix;
+    }
+    if (log.date && log.time) {
+        const parsed = Date.parse(`${log.date}T${log.time}:00`);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return 0;
+}
+
 function getSettings() {
     if (!extension_settings[MODULE_NAME]) {
-        extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS, customPresets: [] };
+        const defKey = getDefaultPresetKey();
+        const { label, shortLabel, ...pricing } = PRESETS[defKey];
+        extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS, preset: defKey, ...pricing, customPresets: [] };
     }
     const merged = Object.assign({}, DEFAULT_SETTINGS, extension_settings[MODULE_NAME]);
     if (!Array.isArray(merged.customPresets)) merged.customPresets = [];
     if (merged.preset !== "custom" && !findPresetByKey(merged.preset, merged)) {
-        const { label, shortLabel, ...pricing } = PRESETS["gemini-4-carbon-promo"];
-        Object.assign(merged, { preset: "gemini-4-carbon-promo", ...pricing });
+        const defKey = getDefaultPresetKey();
+        const { label, shortLabel, ...pricing } = PRESETS[defKey];
+        Object.assign(merged, { preset: defKey, ...pricing });
         extension_settings[MODULE_NAME] = merged;
     }
     return merged;
@@ -373,7 +442,7 @@ function calcTurnCostUsd(normalInput, cacheTokens, outTokens, thinkTokens, total
 /**
  * 일별·월별 통계 기록 (카테고리별 + 모델별 + 호출 출처별 분리 집계)
  */
-function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, costUsd, costKrw, normalInput, cacheTokens, outTokens, thinkTokens, isEstimated }) {
+function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, costUsd, costKrw, savedUsd = 0, savedKrw = 0, normalInput, cacheTokens, outTokens, thinkTokens, isEstimated, exchangeRate }) {
     const stats = loadDailyStats();
     const today = getTodayKey();
 
@@ -422,9 +491,13 @@ function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, c
         category,
         caller: caller || category,
         callerLabel: cKey,
+        modelKey: modelKey || "",
         modelLabel: mKey,
         costUsd,
         costKrw,
+        savedUsd: savedUsd || 0,
+        savedKrw: savedKrw || 0,
+        exchangeRate: exchangeRate || getSettings().exchangeRate,
         totalInput: normalInput + cacheTokens,
         cacheTokens,
         outTokens,
@@ -538,11 +611,13 @@ function deleteRecentLogByIndex(idx) {
  * 통계 & 로그 JSON 백업 다운로드
  */
 function exportCostData() {
+    const s = getSettings();
     const payload = {
         version: EXT_VERSION,
         exportedAt: new Date().toISOString(),
         dailyStats: loadDailyStats(),
         recentLogs: loadRecentLogs(),
+        customPresets: Array.isArray(s.customPresets) ? s.customPresets : [],
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -553,11 +628,11 @@ function exportCostData() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    if (window.toastr) toastr.success("지출 통계 및 로그를 JSON 파일로 백업했습니다.");
+    if (window.toastr) toastr.success("지출 통계·로그·커스텀 프리셋을 JSON 파일로 백업했습니다.");
 }
 
 /**
- * JSON 파일로부터 통계 & 로그 복원
+ * JSON 파일로부터 통계 & 로그 & 커스텀 프리셋 복원
  */
 function triggerImportCostData(onImported) {
     const input = document.createElement("input");
@@ -569,7 +644,7 @@ function triggerImportCostData(onImported) {
         try {
             const text = await file.text();
             const parsed = JSON.parse(text);
-            if (!parsed || typeof parsed !== "object" || (!parsed.dailyStats && !parsed.recentLogs)) {
+            if (!parsed || typeof parsed !== "object" || (!parsed.dailyStats && !parsed.recentLogs && !parsed.customPresets)) {
                 throw new Error("올바른 Gemini 비용 계산기 백업 파일이 아닙니다.");
             }
             if (parsed.dailyStats && typeof parsed.dailyStats === "object") {
@@ -578,9 +653,27 @@ function triggerImportCostData(onImported) {
             if (Array.isArray(parsed.recentLogs)) {
                 saveRecentLogs(parsed.recentLogs);
             }
+            let restoredPresetCount = 0;
+            if (Array.isArray(parsed.customPresets) && parsed.customPresets.length > 0) {
+                const cur = getSettings();
+                const existing = Array.isArray(cur.customPresets) ? [...cur.customPresets] : [];
+                const existingIds = new Set(existing.map(c => c.id));
+                parsed.customPresets.forEach(c => {
+                    if (c && c.id && c.label && !existingIds.has(c.id)) {
+                        existing.push(c);
+                        existingIds.add(c.id);
+                        restoredPresetCount += 1;
+                    }
+                });
+                if (restoredPresetCount > 0) {
+                    updateSettings({ customPresets: existing });
+                    syncDrawerPresetOptions(getSettings());
+                }
+            }
             renderStatsUI();
             resolveErrorCode("GCOST-IMPORT");
-            if (window.toastr) toastr.success("백업 파일에서 지출 통계를 복원했습니다.");
+            const extraMsg = restoredPresetCount > 0 ? ` (커스텀 프리셋 ${restoredPresetCount}개 포함)` : "";
+            if (window.toastr) toastr.success(`백업 파일에서 지출 통계를 복원했습니다.${extraMsg}`);
             if (typeof onImported === "function") onImported();
         } catch (err) {
             recordErrorLog("GCOST-IMPORT", "백업 JSON 복원", err);
@@ -1049,6 +1142,9 @@ function installFetchInterceptor() {
                     normalInput, cacheTokens, outTokens, thinkTokens, totalInput, resolved.pricing
                 );
                 const costKrw = costUsd * curSettings.exchangeRate;
+                const { savedUsd, savedKrw } = calcCacheSaved(
+                    cacheTokens, totalInput, resolved.pricing, curSettings.exchangeRate
+                );
 
                 const record = {
                     category,
@@ -1065,6 +1161,8 @@ function installFetchInterceptor() {
                     isEstimated,
                     costUsd,
                     costKrw,
+                    savedUsd,
+                    savedKrw,
                     exchangeRate: curSettings.exchangeRate,
                     capturedAt: Date.now(),
                 };
@@ -1363,12 +1461,16 @@ async function estimateBasePromptTokens(maxIdx = null) {
 
 /**
  * 최근 API 실측 메인 호출 기록에서 평균 프롬프트 캐시 적중률 자동 산출 (AI 호출 없음)
- * Gemini 암묵적 캐싱 최소 기준(1,024t) 미만 초단발/테스트 호출은 제외
+ * 모델별 공식 암묵적 캐싱 최소 임계값(Gemini 2.5: 2,048t / Gemini 3.x·4: 4,096t) 미만 호출 제외
  */
 function estimateMeasuredCacheRate(fallbackRate = 80) {
     try {
         const logs = loadRecentLogs();
-        const measured = logs.filter(l => l.category === "main" && l.isEstimated === false && (l.totalInput || 0) >= 1024);
+        const measured = logs.filter(l => {
+            if (l.category !== "main" || l.isEstimated !== false) return false;
+            const minTok = getMinCacheTokens(l.modelLabel || l.modelKey || "");
+            return (l.totalInput || 0) >= minTok;
+        });
         if (measured.length > 0) {
             const sumIn = measured.reduce((acc, l) => acc + (l.totalInput || 0), 0);
             const sumCache = measured.reduce((acc, l) => acc + (l.cacheTokens || 0), 0);
@@ -1438,9 +1540,11 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
         }
 
         const maxContextLimit = getEffectiveMaxContext();
+        const minCacheTokens = getMinCacheTokens(settings.preset);
         let runningContext = Math.max(0, Number(basePromptInfo.tokens) || 0);
         let prevContextForCache = 0;
         let aiTurnCount = 0;
+        let measuredTurnCount = 0;
         let sumNormalIn = 0, sumCacheIn = 0, sumOut = 0, sumThink = 0, sumUsd = 0;
         let sumRerollCount = 0, sumRerollKrw = 0;
         let contextCapped = false;
@@ -1462,40 +1566,60 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
                 sumRerollCount += prevCost.rerollCount;
                 sumRerollKrw += prevCost.rerollExtraKrw || 0;
             }
-            const thinkTokens = msg.extra?.reasoning ? await getCachedTokenCount(msg.extra.reasoning) : 0;
-            let totalInput = runningContext;
-            if (maxContextLimit > 0 && totalInput > maxContextLimit) {
-                totalInput = maxContextLimit;
-                contextCapped = true;
-            }
 
+            const hasMeasured = Boolean(prevCost && prevCost.isEstimated === false && prevCost.totalInput > 0);
+            let totalInput = 0;
             let cacheTokens = 0;
-            if (aiTurnCount > 1 && prevContextForCache > 0) {
-                cacheTokens = Math.min(Math.floor(prevContextForCache * (settings.cacheRate / 100)), totalInput);
+            let normalInput = 0;
+            let outTokens = msgTokens;
+            let thinkTokens = 0;
+
+            if (hasMeasured) {
+                measuredTurnCount += 1;
+                totalInput = prevCost.totalInput;
+                cacheTokens = Math.min(prevCost.cacheTokens || 0, totalInput);
+                normalInput = Math.max(0, totalInput - cacheTokens);
+                outTokens = prevCost.outTokens ?? msgTokens;
+                thinkTokens = prevCost.thinkTokens || 0;
+                runningContext = Math.max(runningContext, totalInput);
+            } else {
+                thinkTokens = msg.extra?.reasoning ? await getCachedTokenCount(msg.extra.reasoning) : 0;
+                totalInput = runningContext;
+                if (maxContextLimit > 0 && totalInput > maxContextLimit) {
+                    totalInput = maxContextLimit;
+                    contextCapped = true;
+                }
+
+                // 공식 암묵적 캐싱 최소 토큰 임계값(2,048t / 4,096t) 이상일 때만 캐시 추정 적용
+                if (aiTurnCount > 1 && prevContextForCache >= minCacheTokens && totalInput >= minCacheTokens) {
+                    cacheTokens = Math.min(Math.floor(prevContextForCache * (settings.cacheRate / 100)), totalInput);
+                }
+                normalInput = Math.max(0, totalInput - cacheTokens);
             }
-            const normalInput = Math.max(0, totalInput - cacheTokens);
 
             const { costUsd, isHighTier } = calcTurnCostUsd(
-                normalInput, cacheTokens, msgTokens, thinkTokens, totalInput, settings
+                normalInput, cacheTokens, outTokens, thinkTokens, totalInput, settings
             );
 
             sumNormalIn += normalInput;
             sumCacheIn += cacheTokens;
-            sumOut += msgTokens;
+            sumOut += outTokens;
             sumThink += thinkTokens;
             sumUsd += costUsd;
 
             turnRecords.push({
-                index: i, normalInput, cacheTokens, outTokens: msgTokens, thinkTokens,
-                totalInput, isHighTier, costUsd, costKrw: costUsd * settings.exchangeRate,
+                index: i, normalInput, cacheTokens, outTokens, thinkTokens,
+                totalInput, isHighTier, hasMeasured, costUsd, costKrw: costUsd * settings.exchangeRate,
             });
 
-            runningContext += msgTokens;
+            runningContext += outTokens;
             prevContextForCache = maxContextLimit > 0 ? Math.min(runningContext, maxContextLimit) : runningContext;
         }
 
         const effectiveNextContext = maxContextLimit > 0 ? Math.min(runningContext, maxContextLimit) : runningContext;
-        const nextCache = Math.floor(effectiveNextContext * (settings.cacheRate / 100));
+        const nextCache = effectiveNextContext >= minCacheTokens
+            ? Math.floor(effectiveNextContext * (settings.cacheRate / 100))
+            : 0;
         const nextNormal = Math.max(0, effectiveNextContext - nextCache);
         const nextAvgOut = aiTurnCount > 0 ? Math.round((sumOut + sumThink) / aiTurnCount) : 800;
         const { costUsd: nextTurnUsd } = calcTurnCostUsd(
@@ -1503,7 +1627,7 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
         );
 
         chatResult = {
-            maxIdx, aiTurnCount,
+            maxIdx, aiTurnCount, measuredTurnCount,
             runningContext: effectiveNextContext,
             rawRunningContext: runningContext,
             maxContextLimit, contextCapped,
@@ -1545,7 +1669,7 @@ function getDateKeyOffset(daysAgo) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-function buildLiveStatsHtml() {
+function buildLiveStatsHtml(logFilter = "all", logLimit = 8) {
     const settings = getSettings();
     const stats = loadDailyStats();
     const logs = loadRecentLogs();
@@ -1626,43 +1750,62 @@ function buildLiveStatsHtml() {
     }
     const budgetHtml = budgetBars.length > 0 ? `<div class="gcost-budget-box">${budgetBars.join("")}</div>` : "";
 
-    // 2. 실측 프롬프트 캐시 적중률 모니터링 (1,024t 이상 실측 메인 호출 기준 + 5분 초과 만료 구분)
-    const measuredMainLogs = logs.filter(l => l.category === "main" && l.isEstimated === false && (l.totalInput || 0) >= 1024);
+    // 2. 실측 프롬프트 캐시 적중률 + 절약액 모니터링 (모델별 공식 최소 임계값 기준)
+    const measuredMainLogs = logs.filter(l => {
+        if (l.category !== "main" || l.isEstimated !== false) return false;
+        const minTok = getMinCacheTokens(l.modelLabel || l.modelKey || "");
+        return (l.totalInput || 0) >= minTok;
+    });
+    const belowThresholdMainCount = logs.filter(l => {
+        if (l.category !== "main" || l.isEstimated !== false) return false;
+        const minTok = getMinCacheTokens(l.modelLabel || l.modelKey || "");
+        return (l.totalInput || 0) > 0 && (l.totalInput || 0) < minTok;
+    }).length;
+
     let cacheInsightHtml = "";
     if (measuredMainLogs.length > 0) {
         const sumIn = measuredMainLogs.reduce((acc, l) => acc + (l.totalInput || 0), 0);
         const sumCache = measuredMainLogs.reduce((acc, l) => acc + (l.cacheTokens || 0), 0);
+        const sumSavedKrw = measuredMainLogs.reduce((acc, l) => acc + getLogSavedKrw(l, settings), 0);
         const hitPct = sumIn > 0 ? Math.round((sumCache / sumIn) * 100) : 0;
 
-        // 최근 호출 간격이 대부분 5분(300초)을 넘겼는지 확인
+        // 최근 호출 간격이 긴 편인지 확인 (300초 이상 간격 비율)
         let longGapCount = 0;
         let gapPairs = 0;
         for (let i = 0; i < measuredMainLogs.length - 1; i++) {
-            const newer = measuredMainLogs[i].ts;
-            const older = measuredMainLogs[i + 1].ts;
+            const newer = getLogTimestamp(measuredMainLogs[i]);
+            const older = getLogTimestamp(measuredMainLogs[i + 1]);
             if (newer && older && newer >= older) {
                 gapPairs += 1;
                 if ((newer - older) > 5 * 60 * 1000) longGapCount += 1;
             }
         }
-        const mostlyExpiredByGap = gapPairs > 0 && (longGapCount / gapPairs) >= 0.5;
+        const mostlyLongGap = gapPairs > 0 && (longGapCount / gapPairs) >= 0.5;
+        const savedText = sumSavedKrw >= 1 ? ` · 약 ${Math.round(sumSavedKrw).toLocaleString()}원 절약` : "";
 
         let statusClass = "ok";
-        let statusNote = `최근 실측 ${measuredMainLogs.length}회 평균 · 정상 작동`;
-        if (hitPct < 50 && mostlyExpiredByGap) {
+        let statusNote = `최근 ${measuredMainLogs.length}회 평균${savedText}`;
+        if (hitPct < 50 && mostlyLongGap) {
             statusClass = "warn";
-            statusNote = `요청 간격이 길어 캐시가 풀렸을 수 있어요 (${measuredMainLogs.length}회 평균)`;
+            statusNote = `요청 간격이 길어 캐시가 풀렸을 수 있어요${savedText}`;
         } else if (hitPct === 0 && measuredMainLogs.length >= 2) {
             statusClass = "warn";
             statusNote = "캐시 미작동 · 프롬프트 순서/로어북 점검 권장";
         } else if (hitPct < 50) {
             statusClass = "warn";
-            statusNote = `최근 실측 ${measuredMainLogs.length}회 평균 · 캐시 효율 낮음`;
+            statusNote = `최근 ${measuredMainLogs.length}회 평균 · 캐시 효율 낮음${savedText}`;
         }
         cacheInsightHtml = `
             <div class="gcost-insight-bar ${statusClass}">
                 <span class="gcost-insight-label">실측 캐시 적중률 <strong>${hitPct}%</strong></span>
                 <span class="gcost-insight-note">${statusNote}</span>
+            </div>
+        `;
+    } else if (belowThresholdMainCount > 0) {
+        cacheInsightHtml = `
+            <div class="gcost-insight-bar">
+                <span class="gcost-insight-label">실측 캐시 대기</span>
+                <span class="gcost-insight-note">최근 호출이 최소 캐싱 임계값(2,048~4,096t) 미만이에요</span>
             </div>
         `;
     }
@@ -1741,7 +1884,32 @@ function buildLiveStatsHtml() {
             </div>
         `).join("") || `<div class="gcost-empty-msg">모델별 집계 내역이 없습니다.</div>`;
 
-    const recentRows = logs.slice(0, 8).map((l, idx) => {
+    // 각 메인 로그와 직전 메인 로그의 경과 시간 맵 계산
+    const prevMainGapByIdx = new Map();
+    const mainIndices = [];
+    logs.forEach((l, i) => { if (l.category === "main") mainIndices.push(i); });
+    for (let k = 0; k < mainIndices.length - 1; k++) {
+        const curIdx = mainIndices[k];
+        const prevIdx = mainIndices[k + 1];
+        const curTs = getLogTimestamp(logs[curIdx]);
+        const prevTs = getLogTimestamp(logs[prevIdx]);
+        if (curTs && prevTs && curTs >= prevTs) {
+            prevMainGapByIdx.set(curIdx, curTs - prevTs);
+        }
+    }
+
+    const indexedLogs = logs
+        .map((l, origIdx) => ({ log: l, origIdx }))
+        .filter(({ log }) => {
+            if (logFilter === "main") return log.category === "main";
+            if (logFilter === "aux") return log.category !== "main";
+            return true;
+        });
+
+    const visibleLogs = indexedLogs.slice(0, logLimit);
+    const hasMoreLogs = indexedLogs.length > visibleLogs.length;
+
+    const recentRows = visibleLogs.map(({ log: l, origIdx }) => {
         const showCaller = l.callerLabel && l.callerLabel !== "메인 채팅" && l.callerLabel !== CATEGORY_LABELS[l.category];
         const callerTag = showCaller ? `<span class="gcost-caller-tag" title="${escapeHtml(l.callerLabel)}">${escapeHtml(l.callerLabel)}</span>` : "";
         const totalIn = l.totalInput || 0;
@@ -1749,10 +1917,16 @@ function buildLiveStatsHtml() {
         const normalIn = Math.max(0, totalIn - cacheIn);
         const outT = l.outTokens || 0;
         const thinkT = l.thinkTokens || 0;
+        const hitPct = totalIn > 0 ? Math.round((cacheIn / totalIn) * 100) : 0;
+        const savedKrw = getLogSavedKrw(l, settings);
+        const gapMs = prevMainGapByIdx.get(origIdx);
+        const gapLine = gapMs !== undefined ? `직전 메인 호출 후 ${formatElapsedMs(gapMs)} 경과 · 캐시 ${hitPct}%` : `캐시 ${hitPct}%`;
+        const savedLine = savedKrw >= 1 ? ` (약 ${Math.round(savedKrw).toLocaleString()}원 절약)` : "";
         const logTip = [
             `[${l.isEstimated ? "로컬 추정" : "API 실측"}] ${l.modelLabel} (${l.date || ""} ${l.time || ""})`,
             `입력 ${totalIn.toLocaleString()}t (캐시 ${cacheIn.toLocaleString()}t / 일반 ${normalIn.toLocaleString()}t)`,
             `출력 ${outT.toLocaleString()}t (생각 ${thinkT.toLocaleString()}t 포함)`,
+            `${gapLine}${savedLine}`,
         ].join("\n");
         return `
             <div class="gcost-compare-row gcost-log-row" title="${escapeHtml(logTip)}">
@@ -1763,10 +1937,16 @@ function buildLiveStatsHtml() {
                 </span>
                 <span class="gcost-model-usd">${escapeHtml(l.time)} · ${fmtK(totalIn)}→${fmtK(outT + thinkT)}</span>
                 <span class="gcost-model-krw">${Math.round(l.costKrw).toLocaleString()}원</span>
-                <button type="button" class="gcost-log-del-btn" data-log-idx="${idx}" title="이 로그 삭제 및 통계에서 차감">×</button>
+                <button type="button" class="gcost-log-del-btn" data-log-idx="${origIdx}" title="이 로그 삭제 및 통계에서 차감">×</button>
             </div>
         `;
-    }).join("") || `<div class="gcost-empty-msg">최근 호출 로그가 없습니다.</div>`;
+    }).join("") || `<div class="gcost-empty-msg">해당 조건의 호출 로그가 없습니다.</div>`;
+
+    const logMoreBtnHtml = hasMoreLogs ? `
+        <div class="gcost-log-more-wrap">
+            <button type="button" id="gcost_log_more_btn" class="gcost-btn gcost-btn-xs">더 보기 (${visibleLogs.length} / ${indexedLogs.length}건)</button>
+        </div>
+    ` : "";
 
     const prevMonthSub = prevMonthTotalKrw > 0
         ? ` · 지난달 ${Math.round(prevMonthTotalKrw).toLocaleString()}원`
@@ -1803,11 +1983,174 @@ function buildLiveStatsHtml() {
         </div>
         <div class="gcost-compare-list">${modelRows}</div>
 
-        <div class="gcost-compare-header">
-            <span class="gcost-compare-title">최근 API 호출 로그</span>
-            <span class="gcost-compare-note">최근 8건 · ×로 개별 삭제</span>
+        <div class="gcost-compare-header gcost-log-header">
+            <span class="gcost-compare-title">최근 API 호출 로그 (${indexedLogs.length}건)</span>
+            <div class="gcost-log-filters">
+                <button type="button" class="gcost-filter-chip ${logFilter === "all" ? "active" : ""}" data-filter="all">전체</button>
+                <button type="button" class="gcost-filter-chip ${logFilter === "main" ? "active" : ""}" data-filter="main">메인</button>
+                <button type="button" class="gcost-filter-chip ${logFilter === "aux" ? "active" : ""}" data-filter="aux">확장·부가</button>
+            </div>
         </div>
         <div class="gcost-compare-list">${recentRows}</div>
+        ${logMoreBtnHtml}
+    `;
+}
+
+/**
+ * [v2.0.0 신규] 캐싱 분석 전용 탭 HTML 생성
+ * - 실측 캐시 적중률 · 절약액 · 평균 간격 요약
+ * - 호출 간격별 내 실측 캐시 적중률 구간표
+ * - 최근 실측 턴별 캐시 히트 타임라인
+ */
+function buildCacheAnalysisHtml() {
+    const settings = getSettings();
+    const logs = loadRecentLogs();
+
+    const allMeasuredMain = logs.filter(l => l.category === "main" && l.isEstimated === false && (l.totalInput || 0) > 0);
+    const eligibleLogs = allMeasuredMain.filter(l => (l.totalInput || 0) >= getMinCacheTokens(l.modelLabel || l.modelKey || ""));
+    const excludedShortCount = allMeasuredMain.length - eligibleLogs.length;
+
+    if (eligibleLogs.length === 0) {
+        const reason = excludedShortCount > 0
+            ? `최근 실측 메인 호출 ${excludedShortCount}건이 모두 최소 캐싱 임계값(2,048~4,096t) 미만이라 분석 대상이 아직 없어요.`
+            : "아직 API 실측(usage)으로 기록된 메인 채팅 호출이 없어요. 대화를 몇 턴 진행하시면 내 실측 캐시 패턴이 자동으로 분석됩니다.";
+        return `
+            <div class="gcost-empty-msg" style="padding:22px 14px;line-height:1.6;">
+                <strong style="display:block;color:#334155;margin-bottom:4px;">캐싱 분석 데이터 수집 대기 중</strong>
+                <span>${reason}</span>
+            </div>
+            <div class="gcost-cache-spec-box">
+                <div class="gcost-cache-spec-title">공식 문서 기준 안내 (Google Gemini API · Vertex AI)</div>
+                <ul>
+                    <li><strong>최소 임계값:</strong> Gemini 2.5 계열 2,048t · Gemini 3.x / 4 계열 4,096t 이상</li>
+                    <li><strong>유지 시간:</strong> 암묵적 캐싱은 고정 만료 시간이 없으며 서버 부하·빈도에 따라 동적 관리 (Vertex Durable 최대 24시간)</li>
+                    <li><strong>Gemini 4 멀티턴:</strong> 신규 2,050t 이상 추가 시 직전 턴 전체 롤오버</li>
+                </ul>
+            </div>
+        `;
+    }
+
+    const sumIn = eligibleLogs.reduce((acc, l) => acc + (l.totalInput || 0), 0);
+    const sumCache = eligibleLogs.reduce((acc, l) => acc + (l.cacheTokens || 0), 0);
+    const sumSavedKrw = eligibleLogs.reduce((acc, l) => acc + getLogSavedKrw(l, settings), 0);
+    const totalHitPct = sumIn > 0 ? Math.round((sumCache / sumIn) * 100) : 0;
+
+    // 호출 간격 구간별 집계 (logs는 최신순이므로 i가 newer, i+1이 older)
+    const buckets = [
+        { id: "0-1", label: "0 ~ 1분", min: 0, max: 60_000, count: 0, sumHit: 0, hitCalls: 0 },
+        { id: "1-3", label: "1 ~ 3분", min: 60_000, max: 180_000, count: 0, sumHit: 0, hitCalls: 0 },
+        { id: "3-5", label: "3 ~ 5분", min: 180_000, max: 300_000, count: 0, sumHit: 0, hitCalls: 0 },
+        { id: "5-10", label: "5 ~ 10분", min: 300_000, max: 600_000, count: 0, sumHit: 0, hitCalls: 0 },
+        { id: "10-30", label: "10 ~ 30분", min: 600_000, max: 1_800_000, count: 0, sumHit: 0, hitCalls: 0 },
+        { id: "30+", label: "30분 이상", min: 1_800_000, max: Infinity, count: 0, sumHit: 0, hitCalls: 0 },
+    ];
+
+    const gapByIdx = new Map();
+    let totalGapMs = 0;
+    let gapCount = 0;
+
+    for (let i = 0; i < eligibleLogs.length - 1; i++) {
+        const cur = eligibleLogs[i];
+        const prev = eligibleLogs[i + 1];
+        const curTs = getLogTimestamp(cur);
+        const prevTs = getLogTimestamp(prev);
+        if (!curTs || !prevTs || curTs < prevTs) continue;
+        const diff = curTs - prevTs;
+        gapByIdx.set(i, diff);
+        // 6시간(세션 변경) 이상 떨어진 호출은 평균 간격 왜곡 방지를 위해 평균에서 제외하되 30분+ 구간에는 집계
+        if (diff <= 6 * 3600 * 1000) {
+            totalGapMs += diff;
+            gapCount += 1;
+        }
+        const hitRate = cur.totalInput > 0 ? (cur.cacheTokens || 0) / cur.totalInput : 0;
+        const bucket = buckets.find(b => diff >= b.min && diff < b.max);
+        if (bucket) {
+            bucket.count += 1;
+            bucket.sumHit += hitRate * 100;
+            if (hitRate > 0) bucket.hitCalls += 1;
+        }
+    }
+
+    const avgGapText = gapCount > 0 ? formatElapsedMs(totalGapMs / gapCount) : "-";
+
+    const bucketRowsHtml = buckets.map(b => {
+        const avgPct = b.count > 0 ? Math.round(b.sumHit / b.count) : 0;
+        const barClass = b.count === 0 ? "empty" : (avgPct >= 70 ? "high" : (avgPct >= 30 ? "mid" : "low"));
+        const countLabel = b.count > 0 ? `${b.count}회` : "기록 없음";
+        const pctLabel = b.count > 0 ? `${avgPct}%` : "-";
+        return `
+            <div class="gcost-cache-bucket-row">
+                <span class="gcost-cache-bucket-label">${b.label}</span>
+                <div class="gcost-cache-bar-track">
+                    <div class="gcost-cache-bar-fill ${barClass}" style="width:${b.count > 0 ? Math.max(4, avgPct) : 0}%"></div>
+                </div>
+                <span class="gcost-cache-bucket-cnt">${countLabel}</span>
+                <span class="gcost-cache-bucket-pct">${pctLabel}</span>
+            </div>
+        `;
+    }).join("");
+
+    const timelineRowsHtml = eligibleLogs.slice(0, 12).map((l, idx) => {
+        const totalIn = l.totalInput || 0;
+        const cacheIn = l.cacheTokens || 0;
+        const pct = totalIn > 0 ? Math.round((cacheIn / totalIn) * 100) : 0;
+        const savedKrw = getLogSavedKrw(l, settings);
+        const gapMs = gapByIdx.get(idx);
+        const gapBadge = gapMs !== undefined ? formatElapsedMs(gapMs) : "첫 기록";
+        const barClass = pct >= 70 ? "high" : (pct >= 30 ? "mid" : "low");
+        return `
+            <div class="gcost-cache-tl-row" title="${escapeHtml(`${l.date || ""} ${l.time || ""} · ${l.modelLabel} · 입력 ${totalIn.toLocaleString()}t (캐시 ${cacheIn.toLocaleString()}t)`)}">
+                <span class="gcost-cache-tl-time">${escapeHtml(l.time || "")}</span>
+                <span class="gcost-cache-tl-gap">${escapeHtml(gapBadge)}</span>
+                <span class="gcost-cache-tl-in">${fmtK(totalIn)}t</span>
+                <div class="gcost-cache-bar-track gcost-cache-tl-bar">
+                    <div class="gcost-cache-bar-fill ${barClass}" style="width:${pct > 0 ? Math.max(4, pct) : 0}%"></div>
+                </div>
+                <span class="gcost-cache-tl-pct">${pct}%</span>
+                <span class="gcost-cache-tl-saved">${savedKrw >= 1 ? `-${Math.round(savedKrw).toLocaleString()}원` : "-"}</span>
+            </div>
+        `;
+    }).join("");
+
+    return `
+        <div class="gcost-summary-cards gcost-cards-3">
+            <div class="gcost-card gcost-card-highlight">
+                <div class="gcost-card-title">실측 캐시 적중률</div>
+                <div class="gcost-card-main">${totalHitPct}%</div>
+                <div class="gcost-card-sub">임계값 이상 ${eligibleLogs.length}회</div>
+            </div>
+            <div class="gcost-card">
+                <div class="gcost-card-title">캐시 절약액</div>
+                <div class="gcost-card-main">약 ${Math.round(sumSavedKrw).toLocaleString()}원</div>
+                <div class="gcost-card-sub">최근 실측 ${eligibleLogs.length}회 합계</div>
+            </div>
+            <div class="gcost-card">
+                <div class="gcost-card-title">평균 호출 간격</div>
+                <div class="gcost-card-main">${avgGapText}</div>
+                <div class="gcost-card-sub">${gapCount > 0 ? `연속 ${gapCount}구간 기준` : "데이터 수집 중"}</div>
+            </div>
+        </div>
+
+        <div class="gcost-compare-header">
+            <span class="gcost-compare-title">호출 간격별 내 실측 캐시 적중률</span>
+            <span class="gcost-compare-note">${excludedShortCount > 0 ? `임계값 미만 ${excludedShortCount}건 제외` : "실측 메인 호출 기준"}</span>
+        </div>
+        <div class="gcost-cache-bucket-list">${bucketRowsHtml}</div>
+
+        <div class="gcost-compare-header">
+            <span class="gcost-compare-title">최근 실측 턴별 캐시 타임라인</span>
+            <span class="gcost-compare-note">시각 · 경과 · 입력 · 적중률 · 절약액</span>
+        </div>
+        <div class="gcost-cache-tl-list">${timelineRowsHtml}</div>
+
+        <div class="gcost-cache-spec-box">
+            <div class="gcost-cache-spec-title">공식 문서 기준 안내 (Google Gemini API · Vertex AI)</div>
+            <ul>
+                <li><strong>최소 임계값:</strong> Gemini 2.5 계열 2,048t · Gemini 3.x / 4 계열 4,096t 이상</li>
+                <li><strong>유지 시간:</strong> 암묵적 캐싱은 고정 만료 시간이 없으며 서버 부하·빈도에 따라 동적 관리 (Vertex Durable 최대 24시간)</li>
+                <li><strong>Gemini 4 멀티턴:</strong> 신규 2,050t 이상 추가 시 직전 턴 전체 롤오버</li>
+            </ul>
+        </div>
     `;
 }
 
@@ -2111,9 +2454,24 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             }
         }
 
+        // 12월 1일 이후 Carbon/Argon 프로모션 프리셋이 선택돼 있으면 정상가 원클릭 전환 안내 배너
+        let promoEndWarnHtml = "";
+        if (getTodayKey() > "2026-11-30" && settings.preset === "gemini-4-carbon-promo") {
+            promoEndWarnHtml = `
+                <div class="gcost-tier-warn gcost-promo-warn">
+                    <span>Carbon/Argon 프로모션(11/30)이 종료되었어요.</span>
+                    <button type="button" id="gcost_switch_std_promo_btn" class="gcost-inline-auto-btn active">정상가로 전환</button>
+                </div>
+            `;
+        }
+
         const rerollSub = result.sumRerollCount > 0
             ? ` · 리롤+${result.sumRerollCount}(${Math.round(result.sumRerollKrw).toLocaleString()}원)`
             : ` · ${settings.exchangeRate.toLocaleString()}원`;
+
+        const measuredNote = result.measuredTurnCount > 0
+            ? ` · 실측 ${result.measuredTurnCount}턴 반영`
+            : "";
 
         chatTabHtml = `
             <div class="gcost-summary-cards gcost-cards-3">
@@ -2125,7 +2483,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                 <div class="gcost-card">
                     <div class="gcost-card-title">누적 예상 (${activeShort})</div>
                     <div class="gcost-card-main">약 ${Math.round(result.sumKrw).toLocaleString()}원</div>
-                    <div class="gcost-card-sub" title="환율 ${settings.exchangeRate.toLocaleString()}원">$${result.sumUsd.toFixed(4)}${rerollSub}</div>
+                    <div class="gcost-card-sub" title="환율 ${settings.exchangeRate.toLocaleString()}원${measuredNote}">$${result.sumUsd.toFixed(4)}${rerollSub}</div>
                 </div>
                 <div class="gcost-card">
                     <div class="gcost-card-title">다음 1턴 예상</div>
@@ -2134,6 +2492,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                 </div>
             </div>
 
+            ${promoEndWarnHtml}
             ${tierWarnHtml}
 
             <div class="gcost-meta-grid">
@@ -2163,10 +2522,15 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         `;
     }
 
-    const liveTabHtml = buildLiveStatsHtml();
+    let modalLogFilter = "all";
+    let modalLogLimit = 8;
+
+    const liveTabHtml = buildLiveStatsHtml(modalLogFilter, modalLogLimit);
+    const cacheTabHtml = buildCacheAnalysisHtml();
     const settingsTabHtml = buildModalSettingsHtml(settings, basePromptInfo, cacheRateInfo);
     const isChatTab = defaultTab === "chat";
     const isLiveTab = defaultTab === "live";
+    const isCacheTab = defaultTab === "cache";
     const isSetTab = defaultTab === "settings";
 
     const errCount = loadErrorLogs().length;
@@ -2188,14 +2552,16 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                 </div>
 
                 <div class="gcost-tabs">
-                    <button type="button" class="gcost-tab-btn ${isChatTab ? "active" : ""}" data-tab="chat">현재 채팅 계산</button>
-                    <button type="button" class="gcost-tab-btn ${isLiveTab ? "active" : ""}" data-tab="live">모델·부가기능 내역</button>
+                    <button type="button" class="gcost-tab-btn ${isChatTab ? "active" : ""}" data-tab="chat">현재 채팅</button>
+                    <button type="button" class="gcost-tab-btn ${isLiveTab ? "active" : ""}" data-tab="live">모델·부가</button>
+                    <button type="button" class="gcost-tab-btn ${isCacheTab ? "active" : ""}" data-tab="cache">캐싱 분석</button>
                     <button type="button" class="gcost-tab-btn ${isSetTab ? "active" : ""}" data-tab="settings">설정</button>
                 </div>
 
                 <div class="gcost-modal-body">
                     <div class="gcost-tab-panel ${isChatTab ? "active" : ""}" data-panel="chat">${chatTabHtml}</div>
                     <div class="gcost-tab-panel ${isLiveTab ? "active" : ""}" data-panel="live">${liveTabHtml}</div>
+                    <div class="gcost-tab-panel ${isCacheTab ? "active" : ""}" data-panel="cache">${cacheTabHtml}</div>
                     <div class="gcost-tab-panel ${isSetTab ? "active" : ""}" data-panel="settings">${settingsTabHtml}</div>
                 </div>
 
@@ -2209,12 +2575,46 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
 
     $("body").append(modalHtml);
 
+    const refreshLiveAndCachePanels = () => {
+        modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
+        modalHtml.find('.gcost-tab-panel[data-panel="cache"]').html(buildCacheAnalysisHtml());
+    };
+
     modalHtml.find(".gcost-tab-btn").on("click", function () {
         const target = $(this).data("tab");
         modalHtml.find(".gcost-tab-btn").removeClass("active");
         $(this).addClass("active");
         modalHtml.find(".gcost-tab-panel").removeClass("active");
         modalHtml.find(`.gcost-tab-panel[data-panel="${target}"]`).addClass("active");
+    });
+
+    // 12월 1일 프로모션 종료 시 원클릭 정상가 전환 버튼
+    modalHtml.on("click", "#gcost_switch_std_promo_btn", () => {
+        const { label, shortLabel, ...stdPricing } = PRESETS["gemini-4-carbon-std"];
+        updateSettings({ preset: "gemini-4-carbon-std", ...stdPricing });
+        const updated = getSettings();
+        syncDrawerPresetOptions(updated);
+        $("#gcost_preset").val(updated.preset);
+        $("#gcost_in_base").val(updated.inBase);
+        $("#gcost_cache_base").val(updated.cacheBase);
+        $("#gcost_out_base").val(updated.outBase);
+        $("#gcost_in_high").val(updated.inHigh);
+        $("#gcost_cache_high").val(updated.cacheHigh);
+        $("#gcost_out_high").val(updated.outHigh);
+        if (window.toastr) toastr.success("Carbon / Argon 정상가(12/1~) 프리셋으로 전환했습니다.");
+        openCostModal(upToIndex, "chat");
+    });
+
+    // 탭 2 로그 필터 칩 & 더 보기 버튼 (위임 바인딩)
+    modalHtml.on("click", ".gcost-filter-chip", function () {
+        modalLogFilter = String($(this).data("filter") || "all");
+        modalLogLimit = 8;
+        modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
+    });
+
+    modalHtml.on("click", "#gcost_log_more_btn", () => {
+        modalLogLimit += 15;
+        modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
     });
 
     // 모달 내 설정 탭 이벤트 바인딩
@@ -2281,7 +2681,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         if (isNaN(idx)) return;
         if (!confirm("이 호출 로그를 삭제하고 해당 날짜 통계에서도 차감할까요?")) return;
         if (deleteRecentLogByIndex(idx)) {
-            modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml());
+            refreshLiveAndCachePanels();
             if (window.toastr) toastr.info("로그를 삭제하고 통계를 갱신했습니다.");
         }
     });
@@ -2370,7 +2770,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     modalHtml.find("#gcost_modal_export_btn").on("click", () => exportCostData());
     modalHtml.find("#gcost_modal_import_btn").on("click", () => {
         triggerImportCostData(() => {
-            modalHtml.find('.gcost-tab-panel[data-panel="live"]').html(buildLiveStatsHtml());
+            refreshLiveAndCachePanels();
         });
     });
 
@@ -2444,11 +2844,19 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
 
     if (result) {
         modalHtml.find("#gcost_apply_badges_btn").on("click", async () => {
+            let appliedCount = 0;
+            let preservedCount = 0;
             result.turnRecords.forEach(t => {
                 const msg = chat[t.index];
                 if (!msg) return;
                 if (!msg.extra) msg.extra = {};
                 const prev = msg.extra.gemini_cost;
+                // 이미 API 실측(isEstimated === false)으로 정확히 기록된 말풍선 배지는 덮어쓰지 않고 보존
+                if (prev && prev.isEstimated === false && prev.totalInput > 0) {
+                    preservedCount += 1;
+                    return;
+                }
+                appliedCount += 1;
                 msg.extra.gemini_cost = {
                     category: "main",
                     modelLabel: activeShort,
@@ -2471,7 +2879,12 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             });
             await saveChatConditional();
             renderAllBadges();
-            if (window.toastr) toastr.success("채팅 말풍선에 비용 배지를 일괄 적용했습니다.");
+            if (window.toastr) {
+                const msgText = preservedCount > 0
+                    ? `과거 ${appliedCount}개 말풍선에 적용했습니다. (API 실측 ${preservedCount}개 보존)`
+                    : `채팅 말풍선 ${appliedCount}개에 비용 배지를 일괄 적용했습니다.`;
+                toastr.success(msgText);
+            }
             closeModal();
         });
     }
@@ -2487,6 +2900,11 @@ function formatCost(usd, krw, mode) {
 
 function renderAllBadges() {
     const settings = getSettings();
+    const chatEl = document.getElementById("chat");
+    const wasNearBottom = chatEl
+        ? (chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight) < 80
+        : false;
+
     $(".gcost-badge").remove();
     if (!settings.enabled) return;
 
@@ -2547,6 +2965,11 @@ function renderAllBadges() {
 
         mesEl.append(badge);
     });
+
+    // 배지 추가 직전 스크롤이 바닥 근처에 있었다면, 늘어난 배지 높이만큼 바닥 위치를 유지 (위로 밀림 방지)
+    if (wasNearBottom && chatEl) {
+        chatEl.scrollTop = chatEl.scrollHeight;
+    }
 }
 
 function closeExtraMesButtons($mes, $extraBtns, $btn) {

@@ -1,5 +1,5 @@
 /* =========================================================
-   Gemini Cost Calculator v1.1.1 - Clean Slate UI + Multi-Model
+   Gemini Cost Calculator v2.0.0 - Clean Slate UI + Cache Analytics
    ========================================================= */
 
 .gcost-row {
@@ -1040,6 +1040,210 @@
     user-select: all;
 }
 
+/* 프로모션 종료 전환 배너 */
+.gcost-promo-warn {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* 탭 2 로그 필터 칩 & 더 보기 버튼 */
+.gcost-log-header {
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.gcost-log-filters {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.gcost-filter-chip {
+    padding: 2px 8px !important;
+    margin: 0 !important;
+    font-size: 10.5px !important;
+    font-weight: 600 !important;
+    line-height: 1.4 !important;
+    color: #475569 !important;
+    background: #ffffff !important;
+    border: 1px solid #cbd5e1 !important;
+    border-radius: 999px !important;
+    cursor: pointer;
+    white-space: nowrap !important;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.gcost-filter-chip:hover {
+    background: #f1f5f9 !important;
+    border-color: #94a3b8 !important;
+}
+
+.gcost-filter-chip.active {
+    background: #334155 !important;
+    border-color: #334155 !important;
+    color: #ffffff !important;
+}
+
+.gcost-log-more-wrap {
+    display: flex;
+    justify-content: center;
+    margin-top: 8px;
+}
+
+/* [v2.0.0] 캐싱 분석 전용 탭 스타일 */
+.gcost-cache-bucket-list,
+.gcost-cache-tl-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 8px 10px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    margin-bottom: 10px;
+}
+
+.gcost-cache-bucket-row {
+    display: grid;
+    grid-template-columns: 62px 1fr 48px 38px;
+    align-items: center;
+    gap: 8px;
+    font-size: 11.5px;
+    color: #334155;
+}
+
+.gcost-cache-bucket-label {
+    font-weight: 600;
+    color: #475569;
+    white-space: nowrap;
+}
+
+.gcost-cache-bar-track {
+    width: 100%;
+    height: 7px;
+    background: #e2e8f0;
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.gcost-cache-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.2s ease;
+}
+
+.gcost-cache-bar-fill.high { background: #0f172a; }
+.gcost-cache-bar-fill.mid { background: #64748b; }
+.gcost-cache-bar-fill.low { background: #d97706; }
+.gcost-cache-bar-fill.empty { background: transparent; }
+
+.gcost-cache-bucket-cnt {
+    font-size: 10.5px;
+    color: #64748b;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.gcost-cache-bucket-pct {
+    font-weight: 700;
+    color: #0f172a;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.gcost-cache-tl-row {
+    display: grid;
+    grid-template-columns: 40px 58px 46px 1fr 34px 56px;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    border-radius: 6px;
+    font-size: 11px;
+    color: #334155;
+}
+
+.gcost-cache-tl-row:hover {
+    background: #ffffff;
+}
+
+.gcost-cache-tl-time {
+    color: #64748b;
+    font-variant-numeric: tabular-nums;
+}
+
+.gcost-cache-tl-gap {
+    font-size: 10px;
+    font-weight: 600;
+    color: #475569;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 999px;
+    padding: 1px 5px;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.gcost-cache-tl-in {
+    color: #475569;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.gcost-cache-tl-bar {
+    height: 6px;
+}
+
+.gcost-cache-tl-pct {
+    font-weight: 700;
+    color: #0f172a;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.gcost-cache-tl-saved {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #166534;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.gcost-cache-spec-box {
+    padding: 9px 11px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    font-size: 11px;
+    color: #475569;
+    line-height: 1.55;
+}
+
+.gcost-cache-spec-title {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: #334155;
+    margin-bottom: 4px;
+}
+
+.gcost-cache-spec-box ul {
+    margin: 0;
+    padding-left: 16px;
+}
+
+.gcost-cache-spec-box li {
+    margin-bottom: 3px;
+}
+
+.gcost-cache-spec-box li:last-child {
+    margin-bottom: 0;
+}
+
 /* =========================================================
    모바일 반응형 (좁은 화면 · 터치 환경 최적화)
    ========================================================= */
@@ -1118,6 +1322,18 @@
     .gcost-insight-note {
         text-align: left;
         white-space: normal;
+    }
+
+    .gcost-cache-bucket-row {
+        grid-template-columns: 54px 1fr 42px 34px;
+        gap: 6px;
+        font-size: 11px;
+    }
+
+    .gcost-cache-tl-row {
+        grid-template-columns: 36px 50px 42px 1fr 30px 48px;
+        gap: 4px;
+        font-size: 10.5px;
     }
 
     .gcost-modal-footer {
