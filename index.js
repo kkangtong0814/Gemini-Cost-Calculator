@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "2.2.0";
+const EXT_VERSION = "2.3.0";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -66,6 +66,8 @@ const PRESETS = {
 const DEFAULT_SETTINGS = {
     enabled: true,
     showBadges: true,
+    notifyCacheMiss: false,
+    vertexRegionalMarkup: false,
     interceptFetch: true,
     autoModelPricing: true,
     preset: "gemini-4-carbon-promo",
@@ -550,14 +552,18 @@ function getMinCacheTokens(modelHint = "") {
     return 4096;
 }
 
+function getRegionalMultiplier(settings, isCustomPricing = false) {
+    return (settings?.vertexRegionalMarkup && !isCustomPricing) ? 1.1 : 1;
+}
+
 /**
  * 캐시 적중으로 절약된 금액(USD/KRW) 계산 (일반 입력 단가 대비 차액)
  */
-function calcCacheSaved(cacheTokens, totalInput, pricing, exchangeRate) {
+function calcCacheSaved(cacheTokens, totalInput, pricing, exchangeRate, multiplier = 1) {
     if (!cacheTokens || cacheTokens <= 0 || !pricing) return { savedUsd: 0, savedKrw: 0 };
     const isHighTier = totalInput > (pricing.tierThreshold || 200000);
-    const pIn = isHighTier ? (pricing.inHigh ?? pricing.inBase ?? 0) : (pricing.inBase ?? 0);
-    const pCache = isHighTier ? (pricing.cacheHigh ?? pricing.cacheBase ?? 0) : (pricing.cacheBase ?? 0);
+    const pIn = (isHighTier ? (pricing.inHigh ?? pricing.inBase ?? 0) : (pricing.inBase ?? 0)) * multiplier;
+    const pCache = (isHighTier ? (pricing.cacheHigh ?? pricing.cacheBase ?? 0) : (pricing.cacheBase ?? 0)) * multiplier;
     const diff = Math.max(0, pIn - pCache);
     const savedUsd = (cacheTokens * diff) / 1_000_000;
     const savedKrw = savedUsd * (Number(exchangeRate) || 1400);
@@ -569,7 +575,8 @@ function getLogSavedKrw(log, settings) {
     if (typeof log.savedKrw === "number" && Number.isFinite(log.savedKrw)) return log.savedKrw;
     const resolved = resolveModelPricing(log.modelLabel || log.modelKey || "", settings);
     const rate = log.exchangeRate || settings.exchangeRate || 1400;
-    return calcCacheSaved(log.cacheTokens, log.totalInput || 0, resolved.pricing, rate).savedKrw;
+    const mult = getRegionalMultiplier(settings, !resolved.matched && (settings.preset === "custom" || Boolean(findPresetByKey(settings.preset, settings)?.isCustom)));
+    return calcCacheSaved(log.cacheTokens, log.totalInput || 0, resolved.pricing, rate, mult).savedKrw;
 }
 
 function formatElapsedMs(ms) {
@@ -665,11 +672,11 @@ function resolveModelPricing(modelName, settings) {
     };
 }
 
-function calcTurnCostUsd(normalInput, cacheTokens, outTokens, thinkTokens, totalInput, pricing) {
+function calcTurnCostUsd(normalInput, cacheTokens, outTokens, thinkTokens, totalInput, pricing, multiplier = 1) {
     const isHighTier = totalInput > pricing.tierThreshold;
-    const pIn = isHighTier ? pricing.inHigh : pricing.inBase;
-    const pCache = isHighTier ? pricing.cacheHigh : pricing.cacheBase;
-    const pOut = isHighTier ? pricing.outHigh : pricing.outBase;
+    const pIn = (isHighTier ? pricing.inHigh : pricing.inBase) * multiplier;
+    const pCache = (isHighTier ? pricing.cacheHigh : pricing.cacheBase) * multiplier;
+    const pOut = (isHighTier ? pricing.outHigh : pricing.outBase) * multiplier;
 
     const costUsd = ((normalInput * pIn) + (cacheTokens * pCache) + ((outTokens + thinkTokens) * pOut)) / 1_000_000;
     return { costUsd, isHighTier };
@@ -758,6 +765,19 @@ function recordApiUsage({ category, caller, callerLabel, modelKey, modelLabel, c
 
     renderStatsUI();
     checkBudgetAlerts(stats, today);
+
+    // [v2.3.0] 캐시 풀 미스(0%) 실시간 알림 (사용자가 ⚙ 확장 설정에서 켠 경우에만)
+    try {
+        const curS = getSettings();
+        const totalIn = (normalInput || 0) + (cacheTokens || 0);
+        const minTok = getMinCacheTokens(modelLabel || modelKey || "");
+        if (curS.notifyCacheMiss && window.toastr && category === "main" && isEstimated === false && totalIn >= minTok && (cacheTokens || 0) === 0) {
+            toastr.warning(
+                `입력 ${fmtK(totalIn)}t 전액 일반 과금 (약 ${Math.round(costKrw).toLocaleString()}원)`,
+                "이번 턴 캐시 미적중 (0%)"
+            );
+        }
+    } catch { /* ignore */ }
 }
 
 /**
@@ -1441,12 +1461,14 @@ function installFetchInterceptor() {
 
                 if (totalInput === 0 && outTokens === 0) return;
 
+                const isCustomPricing = !resolved.matched && (curSettings.preset === "custom" || Boolean(findPresetByKey(curSettings.preset, curSettings)?.isCustom));
+                const regionalMult = getRegionalMultiplier(curSettings, isCustomPricing);
                 const { costUsd, isHighTier } = calcTurnCostUsd(
-                    normalInput, cacheTokens, outTokens, thinkTokens, totalInput, resolved.pricing
+                    normalInput, cacheTokens, outTokens, thinkTokens, totalInput, resolved.pricing, regionalMult
                 );
                 const costKrw = costUsd * curSettings.exchangeRate;
                 const { savedUsd, savedKrw } = calcCacheSaved(
-                    cacheTokens, totalInput, resolved.pricing, curSettings.exchangeRate
+                    cacheTokens, totalInput, resolved.pricing, curSettings.exchangeRate, regionalMult
                 );
 
                 const record = {
@@ -1576,8 +1598,10 @@ async function onMessageReceived(messageId) {
     let normalInput = Math.max(0, totalInput - cacheTokens);
 
     const resolved = resolveModelPricing("", settings);
+    const isCustomPricing = settings.preset === "custom" || Boolean(findPresetByKey(settings.preset, settings)?.isCustom);
+    const regionalMult = getRegionalMultiplier(settings, isCustomPricing);
     const { costUsd, isHighTier } = calcTurnCostUsd(
-        normalInput, cacheTokens, outTokens, thinkTokens, totalInput, resolved.pricing
+        normalInput, cacheTokens, outTokens, thinkTokens, totalInput, resolved.pricing, regionalMult
     );
     const costKrw = costUsd * settings.exchangeRate;
 
@@ -1844,6 +1868,8 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
 
         const maxContextLimit = getEffectiveMaxContext();
         const minCacheTokens = getMinCacheTokens(settings.preset);
+        const isCurrentCustom = settings.preset === "custom" || Boolean(findPresetByKey(settings.preset, settings)?.isCustom);
+        const activeRegionalMult = getRegionalMultiplier(settings, isCurrentCustom);
         let runningContext = Math.max(0, Number(basePromptInfo.tokens) || 0);
         let prevContextForCache = 0;
         let aiTurnCount = 0;
@@ -1901,7 +1927,7 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
             }
 
             const { costUsd, isHighTier } = calcTurnCostUsd(
-                normalInput, cacheTokens, outTokens, thinkTokens, totalInput, settings
+                normalInput, cacheTokens, outTokens, thinkTokens, totalInput, settings, activeRegionalMult
             );
 
             sumNormalIn += normalInput;
@@ -1926,7 +1952,10 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
         const nextNormal = Math.max(0, effectiveNextContext - nextCache);
         const nextAvgOut = aiTurnCount > 0 ? Math.round((sumOut + sumThink) / aiTurnCount) : 800;
         const { costUsd: nextTurnUsd } = calcTurnCostUsd(
-            nextNormal, nextCache, nextAvgOut, 0, effectiveNextContext, settings
+            nextNormal, nextCache, nextAvgOut, 0, effectiveNextContext, settings, activeRegionalMult
+        );
+        const { costUsd: nextTurnMissUsd } = calcTurnCostUsd(
+            effectiveNextContext, 0, nextAvgOut, 0, effectiveNextContext, settings, activeRegionalMult
         );
 
         chatResult = {
@@ -1937,6 +1966,7 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
             sumNormalIn, sumCacheIn, sumOut, sumThink,
             sumUsd, sumKrw: sumUsd * settings.exchangeRate,
             nextTurnUsd, nextTurnKrw: nextTurnUsd * settings.exchangeRate,
+            nextTurnMissUsd, nextTurnMissKrw: nextTurnMissUsd * settings.exchangeRate,
             nextAvgOut, turnRecords,
             sumRerollCount, sumRerollKrw,
         };
@@ -2425,6 +2455,28 @@ function buildCacheAnalysisHtml() {
     const sumCache = eligibleLogs.reduce((acc, l) => acc + (l.cacheTokens || 0), 0);
     const sumSavedKrw = eligibleLogs.reduce((acc, l) => acc + getLogSavedKrw(l, settings), 0);
     const totalHitPct = sumIn > 0 ? Math.round((sumCache / sumIn) * 100) : 0;
+    const fullMissCount = eligibleLogs.filter(l => (l.cacheTokens || 0) === 0).length;
+    const fullMissPct = eligibleLogs.length > 0 ? Math.round((fullMissCount / eligibleLogs.length) * 100) : 0;
+
+    // [v2.3.0] 2027/1/12 Hydrogen 및 이후 모델 캐시 쓰기(1.25배) 예고 기준 참고 손익 시뮬레이션
+    // 입력비 배수 = 0.05 * r + 1.25 * (1 - r) = 1.25 - 1.20 * r (본전선 r = 20.83%)
+    const hitRatio = sumIn > 0 ? (sumCache / sumIn) : 0;
+    const writeSimMult = 1.25 - (1.20 * hitRatio);
+    const writeSimDiffPct = Math.round(Math.abs(1 - writeSimMult) * 100);
+    const writeSimIsProfit = writeSimMult <= 1.0;
+    const writeSimBoxHtml = `
+        <div class="gcost-cache-sim-box ${writeSimIsProfit ? "ok" : "warn"}">
+            <div class="gcost-cache-sim-head">
+                <strong>2027/1/12 캐시 쓰기(1.25배) 예고 기준 참고 진단</strong>
+                <span>${writeSimIsProfit ? `입력비 약 ${writeSimDiffPct}% 절감 (이득)` : `입력비 약 ${writeSimDiffPct}% 증가 (주의)`}</span>
+            </div>
+            <div class="gcost-cache-sim-desc">
+                내 실측 캐시율 <strong>${totalHitPct}%</strong> (본전선 20.8% 대비 ${writeSimIsProfit ? "초과" : "미만"}) ·
+                ${writeSimIsProfit ? "Hydrogen 이후 모델에서도 캐싱 유지가 유리한 패턴이에요." : "프롬프트 앞부분 고정·간격 점검 시 절감 효과가 커져요."}
+                <span class="gcost-cache-sim-note">※ 참고 시뮬레이션이며 현재 실제 과금에는 반영되지 않아요.</span>
+            </div>
+        </div>
+    `;
 
     // 호출 간격 구간별 집계 (logs는 최신순이므로 i가 newer, i+1이 older)
     const buckets = [
@@ -2510,7 +2562,7 @@ function buildCacheAnalysisHtml() {
             <div class="gcost-card gcost-card-highlight">
                 <div class="gcost-card-title">실측 캐시 적중률</div>
                 <div class="gcost-card-main">${totalHitPct}%</div>
-                <div class="gcost-card-sub">임계값 이상 ${eligibleLogs.length}회</div>
+                <div class="gcost-card-sub" title="임계값 이상 ${eligibleLogs.length}회 중 완전 실패(0%) ${fullMissCount}회">대상 ${eligibleLogs.length}회 · 풀미스 ${fullMissCount}회(${fullMissPct}%)</div>
             </div>
             <div class="gcost-card">
                 <div class="gcost-card-title">캐시 절약액</div>
@@ -2523,6 +2575,8 @@ function buildCacheAnalysisHtml() {
                 <div class="gcost-card-sub">${gapCount > 0 ? `연속 ${gapCount}구간 기준` : "데이터 수집 중"}</div>
             </div>
         </div>
+
+        ${writeSimBoxHtml}
 
         <div class="gcost-compare-header">
             <span class="gcost-compare-title">호출 간격별 내 실측 캐시 적중률</span>
@@ -2685,6 +2739,10 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
                 <select id="gcost_modal_preset" class="gcost-mset-select">
                     ${presetOptions}
                 </select>
+                <label class="gcost-regional-chk-row" title="Vertex AI에서 지역(Region)을 'global'이 아닌 개별 지역(예: us-central1, asia-northeast3 등)으로 설정하거나, 프록시로 Vertex 개별 지역을 돌려 쓰는 경우에만 체크하세요!&#10;구글 공식 정책상 Vertex 비글로벌 지역 호출은 요금이 10% 더 붙어요. AI Studio나 Vertex global 사용자는 꺼두시면 됩니다.">
+                    <input id="gcost_modal_vertex_regional" type="checkbox" class="gcost-extset-chk" ${settings.vertexRegionalMarkup ? "checked" : ""} />
+                    <span>Vertex AI 비글로벌 지역 설정 (+10% 할증)</span>
+                </label>
             </div>
             <div id="gcost_modal_custom_box" class="gcost-mset-custom-box" style="${settings.preset === "custom" ? "" : "display:none;"}">
                 <div class="gcost-mset-row">
@@ -2856,7 +2914,7 @@ function openExtensionSettingsModal(onChanged) {
                     <span class="gcost-modal-close gcost-extset-close" title="닫기">✕</span>
                 </div>
                 <div class="gcost-modal-body">
-                    <div class="gcost-tab-desc">확장 활성화 여부와 말풍선 비용 배지 표시를 설정해요.</div>
+                    <div class="gcost-tab-desc">확장 활성화 여부와 배지 표시, 캐시 미적중 알림을 한 번에 설정할 수 있어요.</div>
 
                     <div class="gcost-mset-group">
                         <div class="gcost-extset-toggle-row">
@@ -2889,6 +2947,14 @@ function openExtensionSettingsModal(onChanged) {
                                     <span>달러</span>
                                 </label>
                             </div>
+                        </div>
+
+                        <div class="gcost-extset-toggle-row">
+                            <div>
+                                <div class="gcost-extset-title">캐시 풀 미스(0%) 실시간 알림</div>
+                                <div class="gcost-extset-sub">임계값 이상 메인 호출에서 캐시가 0%일 때 토스트로 알려줘요.</div>
+                            </div>
+                            <input id="gcost_ext_notify_miss" type="checkbox" class="gcost-extset-chk" ${s.notifyCacheMiss ? "checked" : ""} />
                         </div>
                     </div>
 
@@ -2961,6 +3027,12 @@ function openExtensionSettingsModal(onChanged) {
         renderAllBadges();
     });
 
+    extModal.find("#gcost_ext_notify_miss").on("change", function () {
+        const checked = $(this).is(":checked");
+        updateSettings({ notifyCacheMiss: checked });
+        if (window.toastr) toastr.info(checked ? "캐시 풀 미스(0%) 실시간 알림을 켰습니다." : "캐시 풀 미스 알림을 껐습니다.");
+    });
+
     extModal.find("#gcost_ext_reset_today").on("click", () => {
         if (!confirm("오늘의 지출 기록을 초기화할까요?")) return;
         const stats = loadDailyStats();
@@ -3031,10 +3103,12 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         }
 
         const compareRows = compareEntries.map(({ key, label, pricing }) => {
+            const isCustomRow = key === "custom" || key.startsWith("custom_");
+            const rowMult = getRegionalMultiplier(settings, isCustomRow);
             let modelUsd = 0;
             result.turnRecords.forEach(t => {
                 const { costUsd } = calcTurnCostUsd(
-                    t.normalInput, t.cacheTokens, t.outTokens, t.thinkTokens, t.totalInput, pricing
+                    t.normalInput, t.cacheTokens, t.outTokens, t.thinkTokens, t.totalInput, pricing, rowMult
                 );
                 modelUsd += costUsd;
             });
@@ -3101,10 +3175,10 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                     <div class="gcost-card-main">약 ${Math.round(result.sumKrw).toLocaleString()}원</div>
                     <div class="gcost-card-sub" title="환율 ${settings.exchangeRate.toLocaleString()}원${measuredNote}">$${result.sumUsd.toFixed(4)}${rerollSub}</div>
                 </div>
-                <div class="gcost-card">
+                <div class="gcost-card" title="캐시 적중 시 약 ${Math.round(result.nextTurnKrw).toLocaleString()}원 ($${result.nextTurnUsd.toFixed(4)}) / 캐시 0% 실패 시 약 ${Math.round(result.nextTurnMissKrw).toLocaleString()}원 ($${result.nextTurnMissUsd.toFixed(4)}) · 평균 출력 ${result.nextAvgOut.toLocaleString()}t">
                     <div class="gcost-card-title">다음 1턴 예상</div>
                     <div class="gcost-card-main">약 ${Math.round(result.nextTurnKrw).toLocaleString()}원</div>
-                    <div class="gcost-card-sub">$${result.nextTurnUsd.toFixed(4)} · ${result.nextAvgOut.toLocaleString()}t</div>
+                    <div class="gcost-card-sub">미적중 시 약 ${Math.round(result.nextTurnMissKrw).toLocaleString()}원</div>
                 </div>
             </div>
 
@@ -3613,8 +3687,13 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         const newBasePrompt = parseInt(modalHtml.find("#gcost_modal_base_prompt").val(), 10);
         const newDailyBudget = parseInt(modalHtml.find("#gcost_modal_daily_budget").val(), 10);
         const newMonthlyBudget = parseInt(modalHtml.find("#gcost_modal_monthly_budget").val(), 10);
+        const newVertexRegional = modalHtml.find("#gcost_modal_vertex_regional").is(":checked");
 
-        const patch = { autoBasePrompt: modalAutoBasePrompt, autoCacheRate: modalAutoCacheRate };
+        const patch = {
+            autoBasePrompt: modalAutoBasePrompt,
+            autoCacheRate: modalAutoCacheRate,
+            vertexRegionalMarkup: newVertexRegional,
+        };
         if (!isNaN(newRate) && newRate > 0) patch.exchangeRate = newRate;
         if (!isNaN(newCache)) patch.cacheRate = newCache;
         if (!isNaN(newBasePrompt) && newBasePrompt >= 0) patch.basePromptTokens = newBasePrompt;
