@@ -3,7 +3,7 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "2.3.0";
+const EXT_VERSION = "2.4.0";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
@@ -66,6 +66,7 @@ const PRESETS = {
 const DEFAULT_SETTINGS = {
     enabled: true,
     showBadges: true,
+    theme: "light",
     notifyCacheMiss: false,
     vertexRegionalMarkup: false,
     interceptFetch: true,
@@ -109,6 +110,7 @@ const WRAPPER_EXTENSION_FRAMES = [
 ];
 
 let lastPromptTokens = 0;
+let lastPendingPromptMessages = null;
 let lastMainPromptAt = 0;
 let lastCapturedMainRecord = null;
 let pendingMainFetchPromise = null;
@@ -172,7 +174,9 @@ function loadDailyStats() {
 }
 
 function saveDailyStats(stats) {
-    localStorage.setItem(STATS_STORAGE_KEY, JSON.stringify(stats));
+    try {
+        localStorage.setItem(STATS_STORAGE_KEY, JSON.stringify(stats));
+    } catch { /* ignore storage quota error */ }
 }
 
 function loadRecentLogs() {
@@ -184,7 +188,9 @@ function loadRecentLogs() {
 }
 
 function saveRecentLogs(logs) {
-    localStorage.setItem(RECENT_LOGS_KEY, JSON.stringify(logs.slice(0, 100)));
+    try {
+        localStorage.setItem(RECENT_LOGS_KEY, JSON.stringify(logs.slice(0, 100)));
+    } catch { /* ignore storage quota error */ }
 }
 
 function loadWallets() {
@@ -625,8 +631,39 @@ function getSettings() {
     return merged;
 }
 
+function syncDarkThemeInputs(root = document, isDark = document.body.classList.contains("gcost-theme-dark")) {
+    const scope = root && typeof root.querySelectorAll === "function" ? root : document;
+    const fields = scope.querySelectorAll(".gcost-modal input.gcost-mset-input, .gcost-modal select.gcost-mset-select, .gcost-modal select.gcost-wallet-select");
+    for (const el of fields) {
+        if (isDark) {
+            el.style.setProperty("background", "#151921", "important");
+            el.style.setProperty("background-color", "#151921", "important");
+            el.style.setProperty("background-image", "none", "important");
+            el.style.setProperty("color", "#e5eaf2", "important");
+            el.style.setProperty("-webkit-text-fill-color", "#e5eaf2", "important");
+            el.style.setProperty("border", "1px solid rgba(148, 163, 184, 0.28)", "important");
+            el.style.setProperty("box-shadow", "inset 0 0 0 100px #151921", "important");
+            el.style.setProperty("filter", "none", "important");
+            el.style.setProperty("backdrop-filter", "none", "important");
+            el.style.setProperty("opacity", "1", "important");
+            el.style.setProperty("color-scheme", "dark", "important");
+        } else {
+            ["background", "background-color", "background-image", "color", "-webkit-text-fill-color", "border", "box-shadow", "filter", "backdrop-filter", "opacity", "color-scheme"].forEach(prop => {
+                el.style.removeProperty(prop);
+            });
+        }
+    }
+}
+
+function applyThemeClass(settings) {
+    const isDark = settings?.theme === "dark";
+    document.body.classList.toggle("gcost-theme-dark", isDark);
+    syncDarkThemeInputs(document, isDark);
+}
+
 function updateSettings(partial) {
     extension_settings[MODULE_NAME] = Object.assign(getSettings(), partial);
+    if ("theme" in partial) applyThemeClass(extension_settings[MODULE_NAME]);
     saveSettingsDebounced();
 }
 
@@ -1293,13 +1330,27 @@ function installFetchInterceptor() {
     const originalFetch = window.fetch.bind(window);
 
     window.fetch = async function (...args) {
-        const settings = getSettings();
-        const url = typeof args[0] === "string"
-            ? args[0]
-            : (args[0] instanceof URL ? args[0].href : (args[0]?.url || ""));
+        // [최적화 Fast-Path] 일반 GET 요청(아바타·CSS·설정 등)은 settings 조회나 URL 파싱 없이 즉시 통과
+        const req0 = args[0];
         const options = args[1] || {};
-        const method = options.method || (typeof args[0] === "object" && args[0]?.method) || "GET";
+        const method = options.method || (req0 && typeof req0 === "object" && !(req0 instanceof URL) ? req0.method : "") || "GET";
+        if (String(method).toUpperCase() !== "POST") {
+            return originalFetch(...args);
+        }
 
+        const url = typeof req0 === "string"
+            ? req0
+            : (req0 instanceof URL ? req0.href : (req0?.url || ""));
+        const lowerUrl = url.toLowerCase();
+        if (
+            !lowerUrl.includes("generate") &&
+            !lowerUrl.includes("completions") &&
+            !lowerUrl.includes("/v1/messages")
+        ) {
+            return originalFetch(...args);
+        }
+
+        const settings = getSettings();
         const isGenEndpoint =
             settings.enabled &&
             settings.interceptFetch &&
@@ -1342,8 +1393,8 @@ function installFetchInterceptor() {
 
                 let usage = null;
                 let respModel = reqModel;
-                let accumulatedOutText = "";
-                let accumulatedThinkText = "";
+                const outChunks = [];
+                const thinkChunks = [];
 
                 const processSseLine = (line) => {
                     const trimmed = line.trim();
@@ -1359,27 +1410,27 @@ function installFetchInterceptor() {
 
                         // OpenAI SSE
                         const delta = chunk.choices?.[0]?.delta;
-                        if (delta?.content) accumulatedOutText += delta.content;
+                        if (delta?.content) outChunks.push(delta.content);
                         if (delta?.reasoning_content || delta?.reasoning) {
-                            accumulatedThinkText += (delta.reasoning_content || delta.reasoning);
+                            thinkChunks.push(delta.reasoning_content || delta.reasoning);
                         }
 
                         // Anthropic SSE
                         if (chunk.delta?.type === "text_delta" && chunk.delta.text) {
-                            accumulatedOutText += chunk.delta.text;
+                            outChunks.push(chunk.delta.text);
                         }
                         if (chunk.delta?.type === "thinking_delta" && chunk.delta.thinking) {
-                            accumulatedThinkText += chunk.delta.thinking;
+                            thinkChunks.push(chunk.delta.thinking);
                         }
 
                         // Gemini 네이티브 SSE
                         const gemParts = chunk.candidates?.[0]?.content?.parts;
                         if (Array.isArray(gemParts)) {
-                            gemParts.forEach(p => {
-                                if (!p?.text) return;
-                                if (p.thought) accumulatedThinkText += p.text;
-                                else accumulatedOutText += p.text;
-                            });
+                            for (const p of gemParts) {
+                                if (!p?.text) continue;
+                                if (p.thought) thinkChunks.push(p.text);
+                                else outChunks.push(p.text);
+                            }
                         }
                     } catch { /* ignore partial */ }
                 };
@@ -1416,9 +1467,11 @@ function installFetchInterceptor() {
                         const data = JSON.parse(trimmedRaw);
                         if (data?.model) respModel = data.model;
                         usage = extractUsageFromPayload(data);
-                        const extracted = extractOutputFromResponseData(data);
-                        accumulatedOutText = extracted.outText;
-                        accumulatedThinkText = extracted.thinkText;
+                        if (!usage) {
+                            const extracted = extractOutputFromResponseData(data);
+                            if (extracted.outText) outChunks.push(extracted.outText);
+                            if (extracted.thinkText) thinkChunks.push(extracted.thinkText);
+                        }
                     }
                 }
 
@@ -1440,10 +1493,11 @@ function installFetchInterceptor() {
                     thinkTokens = usage.thinkTokens;
                     isEstimated = false;
                 } else {
-                    // 메타데이터가 없을 때 로컬 토크나이저로 추정
-                    if (category === "main" && lastPromptTokens > 0) {
-                        totalInput = lastPromptTokens;
-                    } else {
+                    // 메타데이터가 없을 때만 로컬 토크나이저로 지연 추정
+                    if (category === "main") {
+                        totalInput = await resolveLastPromptTokens();
+                    }
+                    if (!totalInput) {
                         const inputText = extractInputTextFromBody(reqBody);
                         if (inputText) {
                             totalInput = await getTokenCountAsync(inputText);
@@ -1455,6 +1509,8 @@ function installFetchInterceptor() {
                     cacheTokens = Math.floor(totalInput * appliedCacheRate);
                     normalInput = Math.max(0, totalInput - cacheTokens);
 
+                    const accumulatedOutText = outChunks.join("");
+                    const accumulatedThinkText = thinkChunks.join("");
                     outTokens = accumulatedOutText ? await getTokenCountAsync(accumulatedOutText) : 0;
                     thinkTokens = accumulatedThinkText ? await getTokenCountAsync(accumulatedThinkText) : 0;
                 }
@@ -1516,27 +1572,37 @@ function installFetchInterceptor() {
     };
 }
 
-async function onPromptReady(eventData) {
-    const settings = getSettings();
-    if (!settings.enabled || eventData?.dryRun) return;
-
-    lastMainPromptAt = Date.now();
+async function resolveLastPromptTokens() {
+    if (lastPromptTokens > 0) return lastPromptTokens;
+    if (!Array.isArray(lastPendingPromptMessages) || lastPendingPromptMessages.length === 0) return 0;
     try {
-        const messages = eventData?.chat || [];
-        const fullText = messages.map(m => {
-            if (typeof m.content === "string") return m.content;
-            if (Array.isArray(m.content)) {
-                return m.content.filter(c => c.type === "text").map(c => c.text).join("\n");
+        const msgs = lastPendingPromptMessages;
+        lastPendingPromptMessages = null;
+        const fullText = msgs.map(m => {
+            if (typeof m?.content === "string") return m.content;
+            if (Array.isArray(m?.content)) {
+                return m.content.filter(c => c?.type === "text").map(c => c.text).join("\n");
             }
             return "";
         }).join("\n");
-
-        lastPromptTokens = await getTokenCountAsync(fullText);
+        lastPromptTokens = fullText ? await getTokenCountAsync(fullText) : 0;
         resolveErrorCode("GCOST-PROMPT");
     } catch (err) {
         recordErrorLog("GCOST-PROMPT", "프롬프트 토큰 계산", err);
         lastPromptTokens = 0;
     }
+    return lastPromptTokens;
+}
+
+function onPromptReady(eventData) {
+    const settings = getSettings();
+    if (!settings.enabled || eventData?.dryRun) return;
+
+    // [최적화] 전송 직전에는 시각과 메시지 참조만 기록하고 즉시 반환
+    // API 실측(usage)이 오면 대형 토크나이저 호출을 아예 생략하고, 폴백 추정 시에만 지연 계산
+    lastMainPromptAt = Date.now();
+    lastPromptTokens = 0;
+    lastPendingPromptMessages = Array.isArray(eventData?.chat) ? eventData.chat.slice() : null;
 }
 
 function attachCostToMessage(message, newRecord) {
@@ -1579,21 +1645,25 @@ async function onMessageReceived(messageId) {
         attachCostToMessage(message, lastCapturedMainRecord);
         lastCapturedMainRecord = null;
         lastPromptTokens = 0;
+        lastPendingPromptMessages = null;
         await saveChatConditional();
         renderAllBadges();
         return;
     }
 
     // 인터셉터가 꺼져 있거나 캡처되지 않은 경우 기존 폴백 로직 수행
-    // 첫 인사말(#0) 로드나 프롬프트 전송 없이 삽입된 메시지(lastPromptTokens === 0)는 실제 API 호출이 아니므로 기록하지 않음
-    const hasRecentMainPrompt = lastPromptTokens > 0 && (Date.now() - lastMainPromptAt) < 180000;
+    // 첫 인사말(#0) 로드나 프롬프트 전송 없이 삽입된 메시지는 실제 API 호출이 아니므로 기록하지 않음
+    const hasPendingPrompt = (lastPromptTokens > 0 || (Array.isArray(lastPendingPromptMessages) && lastPendingPromptMessages.length > 0));
+    const hasRecentMainPrompt = hasPendingPrompt && (Date.now() - lastMainPromptAt) < 180000;
     if (messageId === 0 || !hasRecentMainPrompt) {
         return;
     }
 
+    const totalInput = await resolveLastPromptTokens();
+    if (totalInput <= 0) return;
+
     let outTokens = message.extra?.token_count || await getTokenCountAsync(message.mes || "");
     let thinkTokens = message.extra?.reasoning ? await getTokenCountAsync(message.extra.reasoning) : 0;
-    let totalInput = lastPromptTokens;
     let cacheTokens = Math.floor(totalInput * (settings.cacheRate / 100));
     let normalInput = Math.max(0, totalInput - cacheTokens);
 
@@ -1652,7 +1722,7 @@ async function estimateBasePromptTokens(maxIdx = null) {
                 for (let i = 0; i < measuredIdx; i++) {
                     const m = chat[i];
                     if (!m || m.is_system) continue;
-                    chatMsgsBefore += m.extra?.token_count || await getTokenCountAsync(m.mes || "");
+                    chatMsgsBefore += m.extra?.token_count || await getCachedTokenCount(m.mes || "");
                 }
                 const derived = chat[measuredIdx].extra.gemini_cost.totalInput - chatMsgsBefore;
                 if (derived > 0 && derived < 500000) {
@@ -2437,7 +2507,7 @@ function buildCacheAnalysisHtml() {
             : "아직 API 실측(usage)으로 기록된 메인 채팅 호출이 없어요. 대화를 몇 턴 진행하시면 내 실측 캐시 패턴이 자동으로 분석됩니다.";
         return `
             <div class="gcost-empty-msg" style="padding:22px 14px;line-height:1.6;">
-                <strong style="display:block;color:#334155;margin-bottom:4px;">캐싱 분석 데이터 수집 대기 중</strong>
+                <strong class="gcost-empty-title">캐싱 분석 데이터 수집 대기 중</strong>
                 <span>${reason}</span>
             </div>
             <div class="gcost-cache-spec-box">
@@ -2724,7 +2794,7 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
             <div class="gcost-mset-row">
                 <label class="gcost-mset-label" for="gcost_modal_exchange_rate">
                     <span>원화(KRW) 환율 (1 USD 기준)</span>
-                    <span style="font-weight:500;color:#64748b;">현재 ${Number(settings.exchangeRate).toLocaleString()}원</span>
+                    <span class="gcost-mset-sub-val">현재 ${Number(settings.exchangeRate).toLocaleString()}원</span>
                 </label>
                 <input id="gcost_modal_exchange_rate" type="number" step="1" min="1" class="gcost-mset-input" value="${settings.exchangeRate}" />
                 <div class="gcost-mset-quick-rates">
@@ -2924,6 +2994,17 @@ function openExtensionSettingsModal(onChanged) {
                             </div>
                             <input id="gcost_ext_enabled" type="checkbox" class="gcost-extset-chk" ${s.enabled ? "checked" : ""} />
                         </div>
+
+                        <div class="gcost-extset-toggle-row">
+                            <div>
+                                <div class="gcost-extset-title">화면 테마</div>
+                                <div class="gcost-extset-sub">눈이 편안한 라이트 / 다크 슬레이트 테마 전환</div>
+                            </div>
+                            <div class="gcost-theme-chips">
+                                <button type="button" class="gcost-filter-chip gcost-theme-chip ${s.theme !== "dark" ? "active" : ""}" data-theme="light">라이트</button>
+                                <button type="button" class="gcost-filter-chip gcost-theme-chip ${s.theme === "dark" ? "active" : ""}" data-theme="dark">다크</button>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="gcost-mset-group">
@@ -3025,6 +3106,13 @@ function openExtensionSettingsModal(onChanged) {
         updateSettings({ enabled: $(this).is(":checked") });
         syncDrawerToggles(getSettings());
         renderAllBadges();
+    });
+
+    extModal.find(".gcost-theme-chip").on("click", function () {
+        const nextTheme = $(this).data("theme") === "dark" ? "dark" : "light";
+        updateSettings({ theme: nextTheme });
+        extModal.find(".gcost-theme-chip").removeClass("active");
+        $(this).addClass("active");
     });
 
     extModal.find("#gcost_ext_notify_miss").on("change", function () {
@@ -3277,10 +3365,12 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     `);
 
     $("body").append(modalHtml);
+    syncDarkThemeInputs(modalHtml[0], settings.theme === "dark");
 
     const refreshLiveAndCachePanels = () => {
         modalHtml.find(".gcost-live-inner").html(buildLiveStatsHtml(modalLogFilter, modalLogLimit));
         modalHtml.find(".gcost-cache-inner").html(buildCacheAnalysisHtml());
+        syncDarkThemeInputs(modalHtml[0], getSettings().theme === "dark");
     };
 
     // [v2.1.0] 크레딧 지갑 이벤트 (탭 2 드롭다운 전환, 충전, 잔액 보정, 탭 4 추가/선택/삭제)
@@ -3592,6 +3682,16 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
     });
 
     // 직접 입력(Custom) 프리셋 선택 시 커스텀 단가 입력 박스 토글
+    modalHtml.find("#gcost_modal_vertex_regional").on("change", function () {
+        const checked = $(this).is(":checked");
+        updateSettings({ vertexRegionalMarkup: checked });
+        if (window.toastr) {
+            toastr.info(checked
+                ? "Vertex AI 비글로벌 지역(+10% 할증)을 적용했습니다."
+                : "Vertex AI 비글로벌 할증을 해제했습니다.");
+        }
+    });
+
     modalHtml.find("#gcost_modal_preset").on("change", function () {
         const val = $(this).val();
         if (val === "custom") {
@@ -3810,18 +3910,56 @@ function formatCost(usd, krw, mode) {
     return `${krwStr} (${usdStr})`;
 }
 
+function ensureChatEventDelegation(chatEl) {
+    if (!chatEl || chatEl.dataset.gcostDelegated) return;
+    chatEl.dataset.gcostDelegated = "1";
+
+    $(chatEl).on("click", ".gcost-badge", function (e) {
+        e.stopPropagation();
+        const idx = parseInt(this.dataset.mesid, 10);
+        if (!isNaN(idx)) openCostModal(idx, "chat");
+    });
+
+    $(chatEl).on("click", ".gcost_mes_calc_btn", function () {
+        const $btn = $(this);
+        const $mes = $btn.closest(".mes");
+        const $extraBtns = $mes.find(".extraMesButtons");
+        const mesId = parseInt($mes.attr("mesid"), 10);
+        setTimeout(() => {
+            closeExtraMesButtons($mes, $extraBtns, $btn);
+            openCostModal(isNaN(mesId) ? null : mesId, "chat");
+        }, 0);
+    });
+}
+
 function renderAllBadges() {
     const settings = getSettings();
     const chatEl = document.getElementById("chat");
-    const wasNearBottom = chatEl
-        ? (chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight) < 80
-        : false;
+    if (!chatEl) return;
 
-    $(".gcost-badge").remove();
-    if (!settings.enabled || settings.showBadges === false) return;
+    ensureChatEventDelegation(chatEl);
+
+    if (!settings.enabled || settings.showBadges === false) {
+        chatEl.querySelectorAll(".gcost-badge").forEach(el => el.remove());
+        return;
+    }
+
+    const wasNearBottom = (chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight) < 80;
+
+    // [최적화] DOM을 1회만 순회하여 mesid → .mes_block 맵 구축 (기존 O(N²) 셀렉터 조회 제거)
+    const blockByMesId = new Map();
+    const mesNodes = chatEl.querySelectorAll(".mes");
+    for (const mesNode of mesNodes) {
+        const idStr = mesNode.getAttribute("mesid");
+        if (idStr === null) continue;
+        const block = mesNode.querySelector(".mes_block");
+        if (block) blockByMesId.set(Number(idStr), block);
+    }
 
     let cumulativeUsd = 0;
     let cumulativeKrw = 0;
+    let domChanged = false;
+    const validMesIds = new Set();
 
     chat.forEach((msg, index) => {
         const info = msg?.extra?.gemini_cost;
@@ -3836,11 +3974,21 @@ function renderAllBadges() {
         cumulativeUsd += turnTotalUsd;
         cumulativeKrw += turnTotalKrw;
 
-        const mesEl = $(`#chat .mes[mesid="${index}"] .mes_block`);
-        if (!mesEl.length) return;
+        const blockEl = blockByMesId.get(index);
+        if (!blockEl) return;
+        validMesIds.add(index);
 
         const turnText = formatCost(info.costUsd, info.costKrw, settings.displayMode);
         const totalText = formatCost(cumulativeUsd, cumulativeKrw, settings.displayMode);
+        const sig = `${settings.displayMode}|${info.modelLabel || ""}|${turnText}|${totalText}|${rerollCount}|${Math.round(turnTotalKrw)}|${info.isHighTier ? 1 : 0}|${info.isEstimated ? 1 : 0}`;
+
+        // [최적화] 이미 동일한 내용의 배지가 붙어 있으면 DOM을 건드리지 않고 스킵 (리플로우 99% 감소)
+        const existingBadge = blockEl.querySelector(":scope > .gcost-badge");
+        if (existingBadge && existingBadge.dataset.sig === sig && existingBadge.dataset.mesid === String(index)) {
+            return;
+        }
+        if (existingBadge) existingBadge.remove();
+
         const modelTag = info.modelLabel ? `<span class="gcost-model-pill">${escapeHtml(info.modelLabel)}</span>` : "";
         const rerollTag = rerollCount > 0
             ? `<span class="gcost-reroll-tag" title="리롤/재생성 ${rerollCount}회 추가 (이 턴 총 ${Math.round(turnTotalKrw).toLocaleString()}원)">리롤+${rerollCount} · ${Math.round(turnTotalKrw).toLocaleString()}원</span>`
@@ -3859,27 +4007,32 @@ function renderAllBadges() {
         }
         tooltipLines.push("클릭하면 비용 계산기를 열어요");
 
-        const badge = $(`
-            <div class="gcost-badge" role="button" tabindex="0" title="${escapeHtml(tooltipLines.join("\n"))}">
-                ${modelTag}
-                <span>${estPrefix}${turnText}</span>
-                ${rerollTag}
-                <span class="gcost-sep">·</span>
-                <span>누적 ${totalText}</span>
-                ${tierTag}
-            </div>
-        `);
+        const badgeEl = document.createElement("div");
+        badgeEl.className = "gcost-badge";
+        badgeEl.setAttribute("role", "button");
+        badgeEl.setAttribute("tabindex", "0");
+        badgeEl.setAttribute("title", tooltipLines.join("\n"));
+        badgeEl.dataset.mesid = String(index);
+        badgeEl.dataset.sig = sig;
+        badgeEl.innerHTML = `${modelTag}<span class="gcost-turn-cost">${estPrefix}${turnText}</span>${rerollTag}<span class="gcost-sep">·</span><span class="gcost-total-cost">누적 ${totalText}</span>${tierTag}`;
 
-        badge.on("click", (e) => {
-            e.stopPropagation();
-            openCostModal(index, "chat");
-        });
-
-        mesEl.append(badge);
+        blockEl.appendChild(badgeEl);
+        domChanged = true;
     });
 
+    // 더 이상 비용 데이터가 없는 말풍선의 잔여 배지 정리
+    for (const [id, blockEl] of blockByMesId.entries()) {
+        if (!validMesIds.has(id)) {
+            const stale = blockEl.querySelector(":scope > .gcost-badge");
+            if (stale) {
+                stale.remove();
+                domChanged = true;
+            }
+        }
+    }
+
     // 배지 추가 직전 스크롤이 바닥 근처에 있었다면, 늘어난 배지 높이만큼 바닥 위치를 유지 (위로 밀림 방지)
-    if (wasNearBottom && chatEl) {
+    if (domChanged && wasNearBottom) {
         chatEl.scrollTop = chatEl.scrollHeight;
     }
 }
@@ -3937,30 +4090,23 @@ function closeExtraMesButtons($mes, $extraBtns, $btn) {
     } catch { /* ignore */ }
 }
 
-function injectMessageMoreButtons() {
-    $("#chat .mes").each(function () {
-        const $mes = $(this);
-        const $extraBtns = $mes.find(".extraMesButtons");
-        if (!$extraBtns.length || $extraBtns.find(".gcost_mes_calc_btn").length) return;
+function injectMessageMoreButtons(targetMesNodes = null) {
+    const chatEl = document.getElementById("chat");
+    if (!chatEl) return;
+    ensureChatEventDelegation(chatEl);
 
-        const mesId = parseInt($mes.attr("mesid"), 10);
-        const $btn = $(`
-            <div title="여기까지 채팅 비용 즉시 계산 (AI 호출 없음)"
-                 class="mes_button gcost_mes_calc_btn fa-solid fa-coins interactable"
-                 tabindex="0"></div>
-        `);
+    const nodes = targetMesNodes || chatEl.querySelectorAll(".mes");
+    for (const mesEl of nodes) {
+        if (!mesEl || mesEl.nodeType !== 1) continue;
+        const extraBtns = mesEl.querySelector(".extraMesButtons");
+        if (!extraBtns || extraBtns.querySelector(".gcost_mes_calc_btn")) continue;
 
-        $btn.on("click", () => {
-            // 원래 클릭 이벤트가 테마/ST의 메뉴 닫기 리스너로 정상 전파되도록 stopPropagation을 제거하고,
-            // 한 틱 뒤에 팝업이 아직 열려 있으면 모든 방식으로 확실히 닫은 뒤 모달을 염
-            setTimeout(() => {
-                closeExtraMesButtons($mes, $extraBtns, $btn);
-                openCostModal(isNaN(mesId) ? null : mesId, "chat");
-            }, 0);
-        });
-
-        $extraBtns.append($btn);
-    });
+        const btn = document.createElement("div");
+        btn.title = "여기까지 채팅 비용 즉시 계산 (AI 호출 없음)";
+        btn.className = "mes_button gcost_mes_calc_btn fa-solid fa-coins interactable";
+        btn.tabIndex = 0;
+        extraBtns.appendChild(btn);
+    }
 }
 
 function injectChatMenuButtons() {
@@ -4153,6 +4299,7 @@ function bindSettingsUI() {
 
 jQuery(async () => {
     try {
+        applyThemeClass(getSettings());
         installFetchInterceptor();
 
         const settingsHtml = await $.get(SETTINGS_HTML_URL);
@@ -4163,13 +4310,24 @@ jQuery(async () => {
 
         const chatEl = document.getElementById("chat");
         if (chatEl) {
+            let pendingNodes = new Set();
             let injectTimer = null;
-            const observer = new MutationObserver(() => {
+            const observer = new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                    for (const node of m.addedNodes) {
+                        if (node.nodeType === 1 && node.classList?.contains("mes")) {
+                            pendingNodes.add(node);
+                        }
+                    }
+                }
+                if (pendingNodes.size === 0) return;
                 if (injectTimer) clearTimeout(injectTimer);
                 injectTimer = setTimeout(() => {
+                    const batch = [...pendingNodes];
+                    pendingNodes.clear();
                     injectTimer = null;
-                    injectMessageMoreButtons();
-                }, 100);
+                    injectMessageMoreButtons(batch);
+                }, 80);
             });
             observer.observe(chatEl, { childList: true });
         }
@@ -4199,6 +4357,9 @@ jQuery(async () => {
         eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
         eventSource.on(event_types.CHAT_CHANGED, () => {
+            // 이전 채팅방의 대형 프롬프트 참조 즉시 해제 (메모리 누수 방지)
+            lastPendingPromptMessages = null;
+            lastPromptTokens = 0;
             setTimeout(() => {
                 renderAllBadges();
                 injectMessageMoreButtons();
