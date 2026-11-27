@@ -3,12 +3,13 @@ import { saveSettingsDebounced, eventSource, event_types, chat, saveChatConditio
 import { getTokenCountAsync } from "../../../tokenizers.js";
 
 const MODULE_NAME = "gemini_cost_calculator";
-const EXT_VERSION = "2.4.0";
+const EXT_VERSION = "2.4.1";
 const SETTINGS_HTML_URL = new URL("./settings.html", import.meta.url).href;
 const STATS_STORAGE_KEY = "gemini_cost_daily_stats_v2";
 const RECENT_LOGS_KEY = "gemini_cost_recent_logs_v2";
 const ERROR_LOGS_KEY = "gemini_cost_error_logs_v1";
 const WALLETS_STORAGE_KEY = "gemini_cost_wallets_v1";
+const SYS_SNAP_STORAGE_KEY = "gemini_cost_sys_snap_v3";
 
 // 2026 최신 Gemini 모델별 단가 프리셋 (1M 토큰당 USD)
 const PRESETS = {
@@ -105,6 +106,12 @@ const WRAPPER_EXTENSION_FRAMES = [
     { ext: "blue-lemonade", sub: "/src/addons/perf/" },
     { ext: "ST-QuickActions", sub: "vertex-profile-fix.js" },
     { ext: "ST-QuickActions", sub: "qr-input.js" },
+    { ext: "ST-QuickActions", sub: "error-log.js" },
+    { ext: "ST-QuickActions", sub: "save-guard.js" },
+    { ext: "PerformanceOptimizer" },
+    { ext: "breeze" },
+    { ext: "SillyTavern_ChatLobby" },
+    { ext: "ST-Ko-Localizer" },
     { ext: "perf-assist" },
     { ext: "request-log" },
 ];
@@ -112,12 +119,16 @@ const WRAPPER_EXTENSION_FRAMES = [
 let lastPromptTokens = 0;
 let lastPendingPromptMessages = null;
 let lastMainPromptAt = 0;
+let pendingGenerationType = "normal";
+const promptMsgTagMap = new WeakMap();
 let lastCapturedMainRecord = null;
 let pendingMainFetchPromise = null;
+let modalOpenSeq = 0;
 const notifiedBudgetFlags = new Set();
 const notifiedWalletFlags = new Set();
 const tokenCountCache = new Map();
 let cachedSecretState = null;
+let cachedOpenAiModule = null;
 
 // SillyTavern 다중 API 키 관리(secret_state)에서 키 원문은 절대 읽지 않고 '키 이름(label)'만 안전하게 참조
 import("../../../secrets.js")
@@ -125,6 +136,13 @@ import("../../../secrets.js")
         if (mod && mod.secret_state) cachedSecretState = mod.secret_state;
     })
     .catch(() => { /* 구버전 ST 호환: 미지원 시 무시 */ });
+
+// SillyTavern 공식 promptManager.tokenHandler.getCounts() 참조 (프롬프트 항목별 보기와 100% 동일한 항목별 토큰)
+import("../../../openai.js")
+    .then(mod => {
+        if (mod) cachedOpenAiModule = mod;
+    })
+    .catch(() => { /* 구버전 ST 호환: 미지원 시 폴백 사용 */ });
 
 async function getCachedTokenCount(text) {
     const str = String(text || "");
@@ -191,6 +209,144 @@ function saveRecentLogs(logs) {
     try {
         localStorage.setItem(RECENT_LOGS_KEY, JSON.stringify(logs.slice(0, 100)));
     } catch { /* ignore storage quota error */ }
+}
+
+function loadSysPromptSnapshot() {
+    try {
+        return JSON.parse(localStorage.getItem(SYS_SNAP_STORAGE_KEY)) || {};
+    } catch {
+        return {};
+    }
+}
+
+function getCurrentPromptFingerprint() {
+    try {
+        const ctx = window.SillyTavern?.getContext?.() || {};
+        const presetName = String(ctx.chatCompletionSettings?.preset_settings_openai || "");
+        const charId = String(ctx.characterId ?? "");
+        const persona = String(ctx.powerUserSettings?.persona_description || $("#persona_description").val() || "").trim();
+        return `${presetName}|${charId}|${persona.length}:${persona.slice(0, 24)}`;
+    } catch {
+        return "";
+    }
+}
+
+function saveSysPromptBreakdownSnapshot(chatId, groups) {
+    if (!chatId || !groups) return;
+    const total = (groups.preset || 0) + (groups.char || 0) + (groups.persona || 0) + (groups.lore || 0) + (groups.ext || 0);
+    if (total <= 0) return;
+    try {
+        const all = loadSysPromptSnapshot();
+        all[chatId] = {
+            presetTokens: Math.round(groups.preset || 0),
+            charTokens: Math.round(groups.char || 0),
+            personaTokens: Math.round(groups.persona || 0),
+            loreTokens: Math.round(groups.lore || 0),
+            metaTokens: Math.round(groups.ext || 0),
+            total: Math.round(total),
+            fingerprint: getCurrentPromptFingerprint(),
+            ts: Date.now(),
+        };
+        const keys = Object.keys(all);
+        if (keys.length > 30) {
+            keys.sort((a, b) => (all[b]?.ts || 0) - (all[a]?.ts || 0));
+            keys.slice(30).forEach(k => delete all[k]);
+        }
+        localStorage.setItem(SYS_SNAP_STORAGE_KEY, JSON.stringify(all));
+    } catch { /* ignore */ }
+}
+
+function flattenPromptManagerMessages(collection, out = []) {
+    if (!collection || !Array.isArray(collection.collection)) return out;
+    for (const item of collection.collection) {
+        if (!item) continue;
+        if (Array.isArray(item.collection)) {
+            const parentId = String(item.identifier || "");
+            for (const sub of item.collection) {
+                if (sub && (sub.content || sub.tool_calls)) {
+                    out.push({ identifier: String(sub.identifier || parentId), parentId });
+                }
+            }
+        } else if (item.content || item.tool_calls) {
+            out.push({ identifier: String(item.identifier || ""), parentId: "" });
+        }
+    }
+    return out;
+}
+
+function classifyPromptTag(tag) {
+    if (!tag) return "ext";
+    const id = String(tag.identifier || "");
+    const parentId = String(tag.parentId || "");
+    if (parentId === "chatHistory" || /^chatHistory/i.test(id) || id === "conversation") return "chat";
+    if (["charDescription", "charPersonality", "scenario", "dialogueExamples", "examples", "prompt"].includes(id)) return "char";
+    if (id === "personaDescription") return "persona";
+    if (/^worldInfo(Before|After)$/i.test(id)) return "lore";
+    if (!id) return "ext";
+    return "preset";
+}
+
+function getPromptMessageText(m) {
+    if (!m) return "";
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+        return m.content.map(c => (typeof c === "string" ? c : (c?.text || ""))).join("\n");
+    }
+    return "";
+}
+
+function onPromptReadyFirst(eventData) {
+    try {
+        const settings = getSettings();
+        if (!settings.enabled || eventData?.dryRun || !Array.isArray(eventData?.chat)) return;
+        const pm = cachedOpenAiModule?.promptManager;
+        const src = flattenPromptManagerMessages(pm?.messages);
+        if (src.length !== eventData.chat.length) return;
+        for (let i = 0; i < eventData.chat.length; i++) {
+            const msgObj = eventData.chat[i];
+            if (msgObj && typeof msgObj === "object") {
+                promptMsgTagMap.set(msgObj, src[i]);
+            }
+        }
+    } catch { /* ignore */ }
+}
+
+async function onPromptReadyLast(eventData) {
+    try {
+        const settings = getSettings();
+        if (!settings.enabled || eventData?.dryRun || !Array.isArray(eventData?.chat)) return;
+        if (pendingGenerationType && !["normal", "continue", "regenerate", "swipe"].includes(pendingGenerationType)) {
+            return;
+        }
+        const curChatId = getCurrentChatId();
+        if (!curChatId) return;
+
+        // 태그가 제대로 붙었는지 검증 (확장이 d.chat 객체들을 통째로 새로 교체해 태그가 유실된 경우 스냅샷 덮어쓰기 방지)
+        let taggedChatCount = 0;
+        let anyTagged = false;
+        for (const m of eventData.chat) {
+            const tag = (m && typeof m === "object") ? promptMsgTagMap.get(m) : null;
+            if (tag) {
+                anyTagged = true;
+                if (classifyPromptTag(tag) === "chat") taggedChatCount += 1;
+            }
+        }
+        if (!anyTagged) return;
+        const activeChatMsgs = Array.isArray(chat) ? chat.filter(c => c && !c.is_system).length : 0;
+        if (activeChatMsgs >= 4 && taggedChatCount === 0) return;
+
+        // 최종 전송 배열(d.chat)에서 채팅 기록 제외하고 그룹별 토큰 직접 집계
+        const groups = { preset: 0, char: 0, persona: 0, lore: 0, ext: 0, chat: 0 };
+        for (const m of eventData.chat) {
+            const tag = (m && typeof m === "object") ? promptMsgTagMap.get(m) : null;
+            const grp = classifyPromptTag(tag);
+            if (grp === "chat") continue;
+            const text = getPromptMessageText(m).trim();
+            if (!text) continue;
+            groups[grp] += await getCachedTokenCount(text);
+        }
+        saveSysPromptBreakdownSnapshot(curChatId, groups);
+    } catch { /* ignore */ }
 }
 
 function loadWallets() {
@@ -472,7 +628,9 @@ function resolveErrorCode(code) {
 }
 
 function clearErrorLogs() {
-    localStorage.removeItem(ERROR_LOGS_KEY);
+    try {
+        localStorage.removeItem(ERROR_LOGS_KEY);
+    } catch { /* ignore */ }
 }
 
 function buildDiagnosticReportText() {
@@ -1301,6 +1459,8 @@ function classifyCall(url, reqBody, caller) {
 
 /**
  * 응답 JSON 또는 SSE 청크에서 usage 메타데이터 추출
+ * - Gemini 네이티브(candidatesTokenCount + thoughtsTokenCount): 별도 분리되어 있어 합산 대상
+ * - OpenAI 호환(completion_tokens / output_tokens + reasoning_tokens): 스펙상 출력 총합에 reasoning이 이미 포함되어 있으므로 이중 합산 방지
  */
 function extractUsageFromPayload(data) {
     if (!data || typeof data !== "object") return null;
@@ -1313,10 +1473,38 @@ function extractUsageFromPayload(data) {
         ?? u.cached_tokens
         ?? u.cache_read_input_tokens
         ?? 0;
-    const outTokens = u.candidatesTokenCount ?? u.completion_tokens ?? u.output_tokens ?? 0;
-    const thinkTokens = u.thoughtsTokenCount ?? u.completion_tokens_details?.reasoning_tokens ?? 0;
 
-    if (totalInput === 0 && outTokens === 0) return null;
+    let outTokens = 0;
+    let thinkTokens = 0;
+
+    if (u.candidatesTokenCount !== undefined) {
+        // Gemini 네이티브 포맷: candidatesTokenCount(본문)와 thoughtsTokenCount(생각)가 별도
+        outTokens = Number(u.candidatesTokenCount) || 0;
+        thinkTokens = Number(u.thoughtsTokenCount) || 0;
+    } else {
+        // OpenAI / OpenRouter / Responses API 호환 포맷
+        const rawOut = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+        const rawThink = Number(
+            u.completion_tokens_details?.reasoning_tokens
+            ?? u.output_tokens_details?.reasoning_tokens
+            ?? u.thoughtsTokenCount
+            ?? 0
+        ) || 0;
+        const totalTokens = Number(u.total_tokens ?? u.totalTokenCount ?? 0) || 0;
+
+        // 예외적으로 total_tokens === input + rawOut + rawThink인 공급자(별도 분리형)만 그대로 합산하고,
+        // 표준 OpenAI 포맷(rawOut 안에 reasoning이 이미 포함된 경우)은 본문/생각을 분리해 이중 과금 방지
+        const isSeparateProvider = rawThink > 0 && totalTokens > 0 && (totalTokens === totalInput + rawOut + rawThink);
+        if (isSeparateProvider || rawThink === 0) {
+            outTokens = rawOut;
+            thinkTokens = rawThink;
+        } else {
+            outTokens = Math.max(0, rawOut - rawThink);
+            thinkTokens = rawThink;
+        }
+    }
+
+    if (totalInput === 0 && outTokens === 0 && thinkTokens === 0) return null;
     return { totalInput, cacheTokens, outTokens, thinkTokens };
 }
 
@@ -1493,6 +1681,10 @@ function installFetchInterceptor() {
                     thinkTokens = usage.thinkTokens;
                     isEstimated = false;
                 } else {
+                    // API가 usage 실측도 안 주고 출력·생각 텍스트도 0글자면 스트림 내부 429/연결 실패로 판단해 0원(무시) 처리
+                    // (단, 검열 차단이라도 서버가 usage를 내려준 경우는 위 분기에서 입력 토큰만 정상 과금됨)
+                    if (outChunks.length === 0 && thinkChunks.length === 0) return;
+
                     // 메타데이터가 없을 때만 로컬 토크나이저로 지연 추정
                     if (category === "main") {
                         totalInput = await resolveLastPromptTokens();
@@ -1630,11 +1822,12 @@ async function onMessageReceived(messageId) {
     const message = chat[messageId];
     if (!message || message.is_user || message.is_system) return;
 
-    // fetch 인터셉터의 백그라운드 스트림 분석이 아직 진행 중이면 최대 800ms 대기 (미세 타이밍 중복 집계 방지)
-    if (settings.interceptFetch && !lastCapturedMainRecord && pendingMainFetchPromise) {
+    // fetch 인터셉터의 백그라운드 스트림 분석이 아직 진행 중이면 최대 800ms 대기
+    const activeFetchPromise = (settings.interceptFetch && !lastCapturedMainRecord) ? pendingMainFetchPromise : null;
+    if (activeFetchPromise) {
         try {
             await Promise.race([
-                pendingMainFetchPromise,
+                activeFetchPromise,
                 new Promise(resolve => setTimeout(resolve, 800)),
             ]);
         } catch { /* ignore */ }
@@ -1648,6 +1841,22 @@ async function onMessageReceived(messageId) {
         lastPendingPromptMessages = null;
         await saveChatConditional();
         renderAllBadges();
+        return;
+    }
+
+    // [중복 차감 원천 차단] fetch 인터셉터가 여전히 스트림을 분석 중이면(800ms 초과) 폴백으로 이중 차감하지 않고,
+    // 스트림 분석이 끝난 직후 말풍선 배지만 안전하게 연결
+    if (activeFetchPromise && pendingMainFetchPromise === activeFetchPromise) {
+        activeFetchPromise.then(async () => {
+            if (lastCapturedMainRecord && (Date.now() - lastCapturedMainRecord.capturedAt) < 30000) {
+                attachCostToMessage(message, lastCapturedMainRecord);
+                lastCapturedMainRecord = null;
+                lastPromptTokens = 0;
+                lastPendingPromptMessages = null;
+                await saveChatConditional();
+                renderAllBadges();
+            }
+        }).catch(() => {});
         return;
     }
 
@@ -1702,73 +1911,106 @@ async function onMessageReceived(messageId) {
 }
 
 /**
- * AI 호출 없이 현재 캐릭터·프리셋·페르소나·작가의 노트(또는 API 실측 역산)로 고정 프롬프트 토큰 자동 산출
+ * 실리태번 전송 시 자동 제거되는 주석 매크로({{// ...}}, <%# ... %>) 제외
  */
-async function estimateBasePromptTokens(maxIdx = null) {
-    // 1. 현재 채팅에 API 실측 기록이 있는 AI 메시지가 있다면, (실측 입력 - 직전 말풍선 합계)로 로어북 포함 고정 프롬프트 역산
+function stripStComments(text) {
+    return String(text || "")
+        .replace(/\{\{\/\/[\s\S]*?\}\}/g, "")
+        .replace(/<%#[\s\S]*?%>/g, "")
+        .trim();
+}
+
+/**
+ * 현재 SillyTavern 컨텍스트의 구성요소별 토큰 내역 측정 (캐시 재사용 · AI 호출 없음)
+ * - 실제 전송된 최종 system 프롬프트 스냅샷(lastSentSystemPromptText)이 있으면
+ *   토글/EJS 매크로가 모두 적용된 실제 전송분 기준으로 프리셋 토큰을 산출
+ */
+async function measureContextPromptBreakdown() {
+    const ctx = window.SillyTavern?.getContext?.() || {};
+
+    // 1. 캐릭터 카드 (디스크립션·성격·시나리오·예시 등)
+    const charObj = (ctx.characterId !== undefined && ctx.characters) ? ctx.characters[ctx.characterId] : null;
+    const charParts = charObj ? [
+        charObj.description,
+        charObj.personality,
+        charObj.scenario,
+        charObj.system_prompt,
+        charObj.post_history_instructions,
+        charObj.mes_example,
+    ].filter(v => typeof v === "string" && v.trim()) : [];
+    const charText = stripStComments(charParts.join("\n"));
+
+    // 2. 페르소나
+    const personaText = stripStComments(ctx.powerUserSettings?.persona_description || $("#persona_description").val() || "");
+
+    // 3. 작가의 노트 / 메모리 등 채팅 메타데이터
+    const metaParts = [
+        ctx.chatMetadata?.note_prompt,
+        ctx.chatMetadata?.extensions?.memory,
+    ].filter(v => typeof v === "string" && v.trim());
+    const metaText = stripStComments(metaParts.join("\n"));
+
+    // 4. 연결된 월드인포/로어북의 상시 활성화(constant) 항목 합산
+    let loreText = "";
     try {
-        if (Array.isArray(chat) && chat.length > 0) {
-            const limit = (maxIdx !== null && maxIdx >= 0 && maxIdx < chat.length) ? maxIdx : chat.length - 1;
-            let measuredIdx = -1;
-            for (let i = limit; i >= 0; i--) {
-                const info = chat[i]?.extra?.gemini_cost;
-                if (info && info.isEstimated === false && info.totalInput > 0) {
-                    measuredIdx = i;
-                    break;
-                }
-            }
-            if (measuredIdx >= 0) {
-                let chatMsgsBefore = 0;
-                for (let i = 0; i < measuredIdx; i++) {
-                    const m = chat[i];
-                    if (!m || m.is_system) continue;
-                    chatMsgsBefore += m.extra?.token_count || await getCachedTokenCount(m.mes || "");
-                }
-                const derived = chat[measuredIdx].extra.gemini_cost.totalInput - chatMsgsBefore;
-                if (derived > 0 && derived < 500000) {
-                    return {
-                        tokens: derived,
-                        source: "measured",
-                        detail: `API 실측 역산 (#${measuredIdx}, 로어북 포함)`,
-                    };
-                }
-            }
+        const worldNames = new Set();
+        const charWorld = charObj?.data?.extensions?.world;
+        if (typeof charWorld === "string" && charWorld.trim()) worldNames.add(charWorld.trim());
+        const chatWorld = ctx.chatMetadata?.world_info;
+        if (typeof chatWorld === "string" && chatWorld.trim()) worldNames.add(chatWorld.trim());
+        const globalWorlds = $("#world_info").val();
+        if (Array.isArray(globalWorlds)) {
+            globalWorlds.forEach(w => { if (typeof w === "string" && w.trim()) worldNames.add(w.trim()); });
         }
-    } catch { /* fallback to context sum */ }
 
-    // 2. SillyTavern 현재 컨텍스트(시스템 프리셋 + 캐릭터 카드 + 페르소나 + 작가의 노트)에서 직접 합산
-    try {
-        const ctx = window.SillyTavern?.getContext?.() || {};
+        if (worldNames.size > 0) {
+            const reqHeaders = typeof ctx.getRequestHeaders === "function"
+                ? ctx.getRequestHeaders()
+                : { "Content-Type": "application/json" };
+            const loreChunks = [];
+            await Promise.all([...worldNames].map(async (wName) => {
+                try {
+                    const res = await fetch("/api/worldinfo/get", {
+                        method: "POST",
+                        headers: reqHeaders,
+                        body: JSON.stringify({ name: wName }),
+                    });
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    const entries = Object.values(data?.entries || {});
+                    entries.forEach(e => {
+                        if (e && !e.disable && e.constant === true && typeof e.content === "string" && e.content.trim()) {
+                            loreChunks.push(e.content);
+                        }
+                    });
+                } catch { /* ignore individual worldbook error */ }
+            }));
+            loreText = stripStComments(loreChunks.join("\n"));
+        }
+    } catch { /* ignore lorebook fetch error */ }
 
-        // 2-1. 캐릭터 카드
-        const charObj = (ctx.characterId !== undefined && ctx.characters) ? ctx.characters[ctx.characterId] : null;
-        const charParts = charObj ? [
-            charObj.description,
-            charObj.personality,
-            charObj.scenario,
-            charObj.system_prompt,
-            charObj.post_history_instructions,
-            charObj.mes_example,
-        ].filter(v => typeof v === "string" && v.trim()) : [];
-        const charText = charParts.join("\n");
+    const [charTokens, loreTokens, personaTokens, metaTokens] = await Promise.all([
+        charText ? getCachedTokenCount(charText) : 0,
+        loreText ? getCachedTokenCount(loreText) : 0,
+        personaText ? getCachedTokenCount(personaText) : 0,
+        metaText ? getCachedTokenCount(metaText) : 0,
+    ]);
 
-        // 2-2. 페르소나
-        const personaText = String(ctx.powerUserSettings?.persona_description || $("#persona_description").val() || "").trim();
+    // 5. 시스템 프롬프트 프리셋 토큰 산출 (전송 전 폴백용)
+    let presetTokens = 0;
+    let usedLiveSystemSnapshot = false;
 
-        // 2-3. 작가의 노트 / 메모리 등 채팅 메타데이터
-        const metaParts = [
-            ctx.chatMetadata?.note_prompt,
-            ctx.chatMetadata?.extensions?.memory,
-        ].filter(v => typeof v === "string" && v.trim());
-        const metaText = metaParts.join("\n");
-
-        // 2-4. Chat Completion 활성 시스템 프롬프트 프리셋
+    // 2순위(전송 전 폴백): oai.prompts에서 현재 활성 order 기준으로 측정
+    if (!usedLiveSystemSnapshot) {
         let presetText = "";
         const oai = ctx.chatCompletionSettings;
         if (oai && Array.isArray(oai.prompts)) {
             const enabledIds = new Set();
             if (Array.isArray(oai.prompt_order)) {
-                const orderEntry = oai.prompt_order.find(o => o.character_id === 100001) || oai.prompt_order[oai.prompt_order.length - 1];
+                const orderEntry =
+                    oai.prompt_order.find(o => o.character_id === 100001)
+                    || oai.prompt_order.find(o => o.character_id === 100000)
+                    || oai.prompt_order[oai.prompt_order.length - 1];
                 if (Array.isArray(orderEntry?.order)) {
                     orderEntry.order.forEach(item => {
                         if (item?.enabled && item?.identifier) enabledIds.add(item.identifier);
@@ -1780,79 +2022,193 @@ async function estimateBasePromptTokens(maxIdx = null) {
                 if (enabledIds.size > 0) return enabledIds.has(p.identifier);
                 return p.enabled !== false;
             });
-            presetText = activePrompts.map(p => p.content).join("\n");
+            presetText = stripStComments(activePrompts.map(p => p.content).join("\n"));
         }
+        presetTokens = presetText ? await getCachedTokenCount(presetText) : 0;
+    }
 
-        // 2-5. 연결된 월드인포/로어북의 상시 활성화(constant) 항목 합산 (AI 호출 없음 · 로컬 ST 서버 조회)
-        let loreText = "";
-        try {
-            const worldNames = new Set();
-            const charWorld = charObj?.data?.extensions?.world;
-            if (typeof charWorld === "string" && charWorld.trim()) worldNames.add(charWorld.trim());
-            const chatWorld = ctx.chatMetadata?.world_info;
-            if (typeof chatWorld === "string" && chatWorld.trim()) worldNames.add(chatWorld.trim());
-            const globalWorlds = $("#world_info").val();
-            if (Array.isArray(globalWorlds)) {
-                globalWorlds.forEach(w => { if (typeof w === "string" && w.trim()) worldNames.add(w.trim()); });
-            }
+    return {
+        presetTokens,
+        charTokens,
+        loreTokens,
+        personaTokens,
+        metaTokens,
+        usedLiveSystemSnapshot,
+        total: presetTokens + charTokens + loreTokens + personaTokens + metaTokens,
+    };
+}
 
-            if (worldNames.size > 0) {
-                const reqHeaders = typeof ctx.getRequestHeaders === "function"
-                    ? ctx.getRequestHeaders()
-                    : { "Content-Type": "application/json" };
-                const loreChunks = [];
-                await Promise.all([...worldNames].map(async (wName) => {
-                    try {
-                        const res = await fetch("/api/worldinfo/get", {
-                            method: "POST",
-                            headers: reqHeaders,
-                            body: JSON.stringify({ name: wName }),
-                        });
-                        if (!res.ok) return;
-                        const data = await res.json();
-                        const entries = Object.values(data?.entries || {});
-                        entries.forEach(e => {
-                            if (e && !e.disable && e.constant === true && typeof e.content === "string" && e.content.trim()) {
-                                loreChunks.push(e.content);
-                            }
-                        });
-                    } catch { /* ignore individual worldbook error */ }
-                }));
-                loreText = loreChunks.join("\n");
-            }
-        } catch { /* ignore lorebook fetch error */ }
+/**
+ * 고정 프롬프트 세부 내역을 읽기 편한 2줄(또는 3줄) 툴팁 문자열로 포맷
+ */
+function formatBasePromptTooltip(headerLine, breakdown, extraOtherTokens = 0, isReferenceOnly = false) {
+    const items = [];
+    const presetLabel = breakdown.usedLiveSystemSnapshot ? "프리셋·확장" : "프리셋";
+    if (breakdown.presetTokens > 0) items.push(`${presetLabel} ${breakdown.presetTokens.toLocaleString()}t`);
+    if (breakdown.charTokens > 0) items.push(`캐릭터(디스크립션 등) ${breakdown.charTokens.toLocaleString()}t`);
+    if (breakdown.personaTokens > 0) items.push(`페르소나 ${breakdown.personaTokens.toLocaleString()}t`);
+    if (breakdown.loreTokens > 0) items.push(`상시 로어북 ${breakdown.loreTokens.toLocaleString()}t`);
+    if (breakdown.metaTokens > 0) {
+        const metaLabel = breakdown.fromPromptManager ? "확장·기타" : "작가의 노트·메모";
+        items.push(`${metaLabel} ${breakdown.metaTokens.toLocaleString()}t`);
+    }
+    if (!isReferenceOnly && extraOtherTokens > 0) {
+        items.push(`기타(키워드 로어북·확장 등) ${extraOtherTokens.toLocaleString()}t`);
+    }
 
-        const [presetTokens, charTokens, loreTokens, personaTokens, metaTokens] = await Promise.all([
-            presetText ? getTokenCountAsync(presetText) : 0,
-            charText ? getTokenCountAsync(charText) : 0,
-            loreText ? getTokenCountAsync(loreText) : 0,
-            personaText ? getTokenCountAsync(personaText) : 0,
-            metaText ? getTokenCountAsync(metaText) : 0,
-        ]);
+    if (items.length === 0) return headerLine;
+    const prefix = isReferenceOnly ? "참고 측정: " : "";
+    const noteLine = isReferenceOnly ? "\n※ 토크나이저·토글 차이로 참고 측정치와 다를 수 있어요" : "";
+    if (items.length <= 3) {
+        return `${headerLine}${noteLine}\n(${prefix}${items.join(" · ")})`;
+    }
+    const mid = Math.ceil(items.length / 2);
+    return `${headerLine}${noteLine}\n(${prefix}${items.slice(0, mid).join(" · ")}\n${items.slice(mid).join(" · ")})`;
+}
 
-        const total = presetTokens + charTokens + loreTokens + personaTokens + metaTokens;
-        if (total > 0) {
-            const parts = [];
-            if (presetTokens > 0) parts.push(`프리셋 ${presetTokens.toLocaleString()}`);
-            if (charTokens > 0) parts.push(`캐릭터 ${charTokens.toLocaleString()}`);
-            if (loreTokens > 0) parts.push(`로어북 ${loreTokens.toLocaleString()}`);
-            if (personaTokens > 0) parts.push(`페르소나 ${personaTokens.toLocaleString()}`);
-            if (metaTokens > 0) parts.push(`메모 ${metaTokens.toLocaleString()}`);
-            resolveErrorCode("GCOST-EST");
-            return {
-                tokens: total,
-                source: "context",
-                detail: parts.join(" + "),
-            };
-        }
+/**
+ * SillyTavern 공식 promptManager.tokenHandler.getCounts()에서
+ * 표준 고정 프롬프트 항목별 토큰을 직접 조회 (추가 토크나이징 0회)
+ */
+function readStPromptManagerBreakdown() {
+    try {
+        const pm = cachedOpenAiModule?.promptManager;
+        const counts = pm?.tokenHandler?.getCounts?.();
+        if (!counts || typeof counts !== "object") return null;
+
+        const num = (k) => Math.max(0, Number(counts[k]) || 0);
+
+        // SillyTavern script.js의 parseTokenCounts() 공식 화이트리스트 키만 합산
+        // (ST-Prompt-Template / st-lemonaprom 등 커스텀 프롬프트 키에 남는 미실행 토글 원문 유입 차단)
+        const presetTokens = num("main") + num("nsfw") + num("jailbreak")
+            + num("start") + num("start_chat") + num("controlPrompts")
+            + num("nudge") + num("impersonate") + num("enhanceDefinitions");
+
+        const charTokens = num("prompt") + num("charDescription") + num("charPersonality")
+            + num("scenario") + num("dialogueExamples") + num("examples");
+
+        const personaTokens = num("personaDescription");
+        const loreTokens = num("worldInfoBefore") + num("worldInfoAfter");
+        const metaTokens = num("bias");
+
+        const total = presetTokens + charTokens + personaTokens + loreTokens + metaTokens;
+        if (total <= 0) return null;
+
+        return {
+            presetTokens,
+            charTokens,
+            loreTokens,
+            personaTokens,
+            metaTokens,
+            fromPromptManager: true,
+            total,
+        };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * AI 호출 없이 현재 고정 프롬프트 토큰 자동 산출
+ * 0순위: 실제 전송 최종 배열(makeFirst WeakMap 태깅 → makeLast 직접 집계) 스냅샷 + 지문 일치 검증
+ * 1순위: SillyTavern 공식 promptManager 표준 키 집계 (전송 전 안전 폴백)
+ * 2순위: 현재 컨텍스트 설정값 참고 합산 (구버전 ST 폴백)
+ */
+async function estimateBasePromptTokens(maxIdx = null) {
+    const curChatId = getCurrentChatId();
+    const curFp = getCurrentPromptFingerprint();
+    const taggedSnap = curChatId ? loadSysPromptSnapshot()[curChatId] : null;
+    const isSnapFresh = Boolean(
+        taggedSnap &&
+        taggedSnap.total > 0 &&
+        (!taggedSnap.fingerprint || !curFp || taggedSnap.fingerprint === curFp)
+    );
+
+    // 0순위(최우선): 실제 전송 최종 배열 WeakMap 집계 스냅샷 (프리셋/캐릭터/페르소나 지문 일치 시)
+    if (isSnapFresh) {
+        const snapBreakdown = {
+            presetTokens: taggedSnap.presetTokens || 0,
+            charTokens: taggedSnap.charTokens || 0,
+            personaTokens: taggedSnap.personaTokens || 0,
+            loreTokens: taggedSnap.loreTokens || 0,
+            metaTokens: taggedSnap.metaTokens || 0,
+            fromPromptManager: true,
+            total: taggedSnap.total,
+        };
+        const parts = [];
+        if (snapBreakdown.presetTokens > 0) parts.push(`프리셋 ${snapBreakdown.presetTokens.toLocaleString()}`);
+        if (snapBreakdown.charTokens > 0) parts.push(`캐릭터 ${snapBreakdown.charTokens.toLocaleString()}`);
+        if (snapBreakdown.personaTokens > 0) parts.push(`페르소나 ${snapBreakdown.personaTokens.toLocaleString()}`);
+        if (snapBreakdown.loreTokens > 0) parts.push(`로어북 ${snapBreakdown.loreTokens.toLocaleString()}`);
+        if (snapBreakdown.metaTokens > 0) parts.push(`확장·기타 ${snapBreakdown.metaTokens.toLocaleString()}`);
+        resolveErrorCode("GCOST-EST");
+        return {
+            tokens: snapBreakdown.total,
+            source: "measured",
+            detail: parts.join(" · "),
+            tooltip: formatBasePromptTooltip(
+                `최종 전송 프롬프트 집계 (총 ${snapBreakdown.total.toLocaleString()}t)`,
+                snapBreakdown,
+                0
+            ) + "\n※ 실제 전송 최종본 기준 (ST 항목별 보기와 일부 다를 수 있음)",
+        };
+    }
+
+    // 1순위(전송 전 또는 설정 변경 직후 폴백): SillyTavern 공식 promptManager 표준 키 집계
+    const pmBreakdown = readStPromptManagerBreakdown();
+    if (pmBreakdown && pmBreakdown.total > 0) {
+        const parts = [];
+        if (pmBreakdown.presetTokens > 0) parts.push(`프리셋 ${pmBreakdown.presetTokens.toLocaleString()}`);
+        if (pmBreakdown.charTokens > 0) parts.push(`캐릭터 ${pmBreakdown.charTokens.toLocaleString()}`);
+        if (pmBreakdown.personaTokens > 0) parts.push(`페르소나 ${pmBreakdown.personaTokens.toLocaleString()}`);
+        if (pmBreakdown.loreTokens > 0) parts.push(`로어북 ${pmBreakdown.loreTokens.toLocaleString()}`);
+        if (pmBreakdown.metaTokens > 0) parts.push(`확장·기타 ${pmBreakdown.metaTokens.toLocaleString()}`);
+        resolveErrorCode("GCOST-EST");
+        return {
+            tokens: pmBreakdown.total,
+            source: "measured",
+            detail: parts.join(" · "),
+            tooltip: formatBasePromptTooltip(
+                `실리태번 항목별 집계 (총 ${pmBreakdown.total.toLocaleString()}t)`,
+                pmBreakdown,
+                0
+            ) + "\n※ 전송 전 참고 집계 (1턴 전송 시 실제 최종본으로 자동 갱신)",
+        };
+    }
+
+    // 2순위(구버전 ST 최후 폴백): 현재 컨텍스트 직접 합산 (장기 채팅 오차를 유발하는 역산 방식은 영구 제거)
+    let rawBreakdown = { presetTokens: 0, charTokens: 0, loreTokens: 0, personaTokens: 0, metaTokens: 0, total: 0 };
+    try {
+        rawBreakdown = await measureContextPromptBreakdown();
     } catch (err) {
-        recordErrorLog("GCOST-EST", "고정 프롬프트 측정", err);
+        recordErrorLog("GCOST-EST", "고정 프롬프트 구성요소 측정", err);
+    }
+
+    if (rawBreakdown.total > 0) {
+        const parts = [];
+        if (rawBreakdown.presetTokens > 0) parts.push(`프리셋 ${rawBreakdown.presetTokens.toLocaleString()}`);
+        if (rawBreakdown.charTokens > 0) parts.push(`캐릭터 ${rawBreakdown.charTokens.toLocaleString()}`);
+        if (rawBreakdown.loreTokens > 0) parts.push(`로어북 ${rawBreakdown.loreTokens.toLocaleString()}`);
+        if (rawBreakdown.personaTokens > 0) parts.push(`페르소나 ${rawBreakdown.personaTokens.toLocaleString()}`);
+        if (rawBreakdown.metaTokens > 0) parts.push(`메모 ${rawBreakdown.metaTokens.toLocaleString()}`);
+        resolveErrorCode("GCOST-EST");
+        return {
+            tokens: rawBreakdown.total,
+            source: "context",
+            detail: parts.join(" + "),
+            tooltip: formatBasePromptTooltip(
+                `현재 설정 참고 합산 (총 ${rawBreakdown.total.toLocaleString()}t)`,
+                rawBreakdown,
+                0
+            ),
+        };
     }
 
     return {
         tokens: Math.max(0, Number(getSettings().basePromptTokens) || 2500),
         source: "manual",
         detail: "기본값 사용",
+        tooltip: "기본값 사용 (수동 입력 가능)",
     };
 }
 
@@ -1892,6 +2248,7 @@ function estimateMeasuredCacheRate(fallbackRate = 80) {
  * 로컬 채팅 즉시 계산 (AI 호출 없음) + 실시간 모델/부가기능 내역 모달 열기
  */
 async function openCostModal(upToIndex = null, defaultTab = "chat") {
+    const reqSeq = ++modalOpenSeq;
     let settings = getSettings();
     let chatResult = null;
     let basePromptInfo = {
@@ -2042,6 +2399,7 @@ async function openCostModal(upToIndex = null, defaultTab = "chat") {
         };
     }
 
+    if (reqSeq !== modalOpenSeq) return;
     renderCombinedModal(settings, chatResult, defaultTab, upToIndex, basePromptInfo, cacheRateInfo);
 }
 
@@ -2703,9 +3061,11 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
     }).join("");
 
     const autoActiveClass = settings.autoBasePrompt ? "active" : "";
-    const autoHint = basePromptInfo?.detail
-        ? `현재 산출: ${escapeHtml(basePromptInfo.detail)}`
-        : "현재 캐릭터·프리셋·페르소나 기준으로 자동 측정";
+    const autoHint = basePromptInfo?.tooltip
+        ? escapeHtml(basePromptInfo.tooltip)
+        : (basePromptInfo?.detail
+            ? `현재 산출: ${escapeHtml(basePromptInfo.detail)}`
+            : "현재 캐릭터·프리셋·페르소나 기준으로 자동 측정");
 
     const autoCacheClass = settings.autoCacheRate ? "active" : "";
     const autoCacheDetail = cacheRateInfo?.detail || (settings.autoCacheRate ? "실측 대기 (기본값)" : "수동 설정값");
@@ -2848,7 +3208,9 @@ function buildModalSettingsHtml(settings, basePromptInfo = null, cacheRateInfo =
                             <button type="button" id="gcost_modal_auto_cache_btn" class="gcost-inline-auto-btn ${autoCacheClass}" title="${autoCacheHint}">${settings.autoCacheRate ? "자동" : "자동 맞춤"}</button>
                         </span>
                     </label>
-                    <input id="gcost_modal_cache_rate" type="range" min="0" max="99" step="1" value="${settings.cacheRate}" style="width:100%;margin-top:6px;" />
+                    <div class="gcost-range-wrap">
+                        <input id="gcost_modal_cache_rate" type="range" min="0" max="99" step="1" value="${settings.cacheRate}" />
+                    </div>
                     <div id="gcost_modal_cache_detail" class="gcost-mset-hint" title="${autoCacheHint}">${escapeHtml(autoCacheDetail)}</div>
                 </div>
                 <div class="gcost-mset-row">
@@ -3251,11 +3613,12 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             ? ` · 실측 ${result.measuredTurnCount}턴 반영`
             : "";
 
+        const thisTurnPrefix = thisTurn?.hasMeasured ? "" : "약 ";
         chatTabHtml = `
             <div class="gcost-summary-cards gcost-cards-3">
                 <div class="gcost-card gcost-card-highlight">
                     <div class="gcost-card-title">${thisTurnTitle}</div>
-                    <div class="gcost-card-main">약 ${thisTurnKrw}원</div>
+                    <div class="gcost-card-main">${thisTurnPrefix}${thisTurnKrw}원</div>
                     <div class="gcost-card-sub">$${thisTurnUsd} · 출력 ${thisTurnOut}t</div>
                 </div>
                 <div class="gcost-card">
@@ -3274,7 +3637,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
             ${tierWarnHtml}
 
             <div class="gcost-meta-grid">
-                <div class="gcost-meta-item" title="고정 프롬프트 ${(basePromptInfo?.tokens ?? settings.basePromptTokens).toLocaleString()}t (${escapeHtml(basePromptInfo?.detail || "설정값")})${result.contextCapped ? ` · 최대 컨텍스트(${fmtK(result.maxContextLimit)}t) 상한 적용됨` : ""}">
+                <div class="gcost-meta-item" title="${escapeHtml(basePromptInfo?.tooltip || `고정 프롬프트 ${(basePromptInfo?.tokens ?? settings.basePromptTokens).toLocaleString()}t (${basePromptInfo?.detail || "설정값"})`)}${result.contextCapped ? `\n최대 컨텍스트(${fmtK(result.maxContextLimit)}t) 상한 적용됨` : ""}">
                     <span class="gcost-meta-label">현재 컨텍스트</span>
                     <span class="gcost-meta-val">${fmtK(result.runningContext)}t${result.contextCapped ? " (상한)" : ""}</span>
                 </div>
@@ -3357,7 +3720,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                 </div>
 
                 <div class="gcost-modal-footer">
-                    ${result ? `<button type="button" id="gcost_apply_badges_btn" class="gcost-btn gcost-btn-primary">배지 일괄 적용</button>` : ""}
+                    ${result ? `<button type="button" id="gcost_apply_badges_btn" class="gcost-btn gcost-btn-primary ${isChatTab ? "" : "gcost-hidden"}">배지 일괄 적용</button>` : ""}
                     <button type="button" id="gcost_close_modal_btn" class="gcost-btn">닫기</button>
                 </div>
             </div>
@@ -3581,6 +3944,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         $(this).addClass("active");
         modalHtml.find(".gcost-tab-panel").removeClass("active");
         modalHtml.find(`.gcost-tab-panel[data-panel="${target}"]`).addClass("active");
+        modalHtml.find("#gcost_apply_badges_btn").toggleClass("gcost-hidden", target !== "chat");
     });
 
     // 12월 1일 프로모션 종료 시 원클릭 정상가 전환 버튼
@@ -3653,9 +4017,10 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
         $btn.text("측정 중…");
         const est = await estimateBasePromptTokens(upToIndex);
         modalAutoBasePrompt = true;
-        modalHtml.find("#gcost_modal_base_prompt").val(est.tokens).attr("title", `현재 산출: ${est.detail}`);
-        modalHtml.find("#gcost_modal_base_detail").text(est.detail).attr("title", `현재 산출: ${est.detail}`);
-        $btn.addClass("active").text("자동").attr("title", `현재 산출: ${est.detail}`);
+        const tipText = est.tooltip || `현재 산출: ${est.detail}`;
+        modalHtml.find("#gcost_modal_base_prompt").val(est.tokens).attr("title", tipText);
+        modalHtml.find("#gcost_modal_base_detail").text(est.detail).attr("title", tipText);
+        $btn.addClass("active").text("자동").attr("title", tipText);
         if (window.toastr) {
             toastr.info(`고정 프롬프트 ${est.tokens.toLocaleString()}t (${est.detail})`);
         }
@@ -3690,6 +4055,7 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
                 ? "Vertex AI 비글로벌 지역(+10% 할증)을 적용했습니다."
                 : "Vertex AI 비글로벌 할증을 해제했습니다.");
         }
+        openCostModal(upToIndex, "settings");
     });
 
     modalHtml.find("#gcost_modal_preset").on("change", function () {
@@ -3903,8 +4269,10 @@ function renderCombinedModal(settings, result, defaultTab, upToIndex = null, bas
 }
 
 function formatCost(usd, krw, mode) {
-    const krwStr = `${Math.round(krw).toLocaleString()}원`;
-    const usdStr = `$${usd.toFixed(4)}`;
+    const safeUsd = Number.isFinite(Number(usd)) ? Number(usd) : 0;
+    const safeKrw = Number.isFinite(Number(krw)) ? Number(krw) : 0;
+    const krwStr = `${Math.round(safeKrw).toLocaleString()}원`;
+    const usdStr = `$${safeUsd.toFixed(4)}`;
     if (mode === "krw") return krwStr;
     if (mode === "usd") return usdStr;
     return `${krwStr} (${usdStr})`;
@@ -3915,6 +4283,14 @@ function ensureChatEventDelegation(chatEl) {
     chatEl.dataset.gcostDelegated = "1";
 
     $(chatEl).on("click", ".gcost-badge", function (e) {
+        e.stopPropagation();
+        const idx = parseInt(this.dataset.mesid, 10);
+        if (!isNaN(idx)) openCostModal(idx, "chat");
+    });
+
+    $(chatEl).on("keydown", ".gcost-badge", function (e) {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
         e.stopPropagation();
         const idx = parseInt(this.dataset.mesid, 10);
         if (!isNaN(idx)) openCostModal(idx, "chat");
@@ -3965,11 +4341,13 @@ function renderAllBadges() {
         const info = msg?.extra?.gemini_cost;
         if (!info) return;
 
-        const rerollCount = info.rerollCount || 0;
-        const rerollExtraUsd = info.rerollExtraUsd || 0;
-        const rerollExtraKrw = info.rerollExtraKrw || 0;
-        const turnTotalUsd = info.costUsd + rerollExtraUsd;
-        const turnTotalKrw = info.costKrw + rerollExtraKrw;
+        const baseUsd = Number(info.costUsd) || 0;
+        const baseKrw = Number(info.costKrw) || 0;
+        const rerollCount = Number(info.rerollCount) || 0;
+        const rerollExtraUsd = Number(info.rerollExtraUsd) || 0;
+        const rerollExtraKrw = Number(info.rerollExtraKrw) || 0;
+        const turnTotalUsd = baseUsd + rerollExtraUsd;
+        const turnTotalKrw = baseKrw + rerollExtraKrw;
 
         cumulativeUsd += turnTotalUsd;
         cumulativeKrw += turnTotalKrw;
@@ -3978,7 +4356,7 @@ function renderAllBadges() {
         if (!blockEl) return;
         validMesIds.add(index);
 
-        const turnText = formatCost(info.costUsd, info.costKrw, settings.displayMode);
+        const turnText = formatCost(baseUsd, baseKrw, settings.displayMode);
         const totalText = formatCost(cumulativeUsd, cumulativeKrw, settings.displayMode);
         const sig = `${settings.displayMode}|${info.modelLabel || ""}|${turnText}|${totalText}|${rerollCount}|${Math.round(turnTotalKrw)}|${info.isHighTier ? 1 : 0}|${info.isEstimated ? 1 : 0}`;
 
@@ -3996,11 +4374,18 @@ function renderAllBadges() {
         const tierTag = info.isHighTier ? `<span class="gcost-tier-tag">200k+</span>` : "";
         const estPrefix = info.isEstimated ? "약 " : "";
 
+        const safeTotalIn = Number(info.totalInput) || 0;
+        const safeCacheIn = Number(info.cacheTokens) || 0;
+        const safeNormalIn = Number(info.normalInput) || 0;
+        const safeOut = Number(info.outTokens) || 0;
+        const safeThink = Number(info.thinkTokens) || 0;
+        const safeRate = Number(info.exchangeRate) || settings.exchangeRate || 1400;
+
         const tooltipLines = [
             `[모델] ${info.modelLabel || "기본"}`,
-            `[입력] 총 ${info.totalInput.toLocaleString()} (캐시 ${info.cacheTokens.toLocaleString()} / 일반 ${info.normalInput.toLocaleString()})`,
-            `[출력] ${info.outTokens.toLocaleString()} (생각 ${(info.thinkTokens || 0).toLocaleString()} 포함)`,
-            `[기준] ${info.isEstimated ? "추정치" : "API 실측"} | 환율 ${info.exchangeRate}원`,
+            `[입력] 총 ${safeTotalIn.toLocaleString()} (캐시 ${safeCacheIn.toLocaleString()} / 일반 ${safeNormalIn.toLocaleString()})`,
+            `[출력] ${safeOut.toLocaleString()} (생각 ${safeThink.toLocaleString()} 포함)`,
+            `[기준] ${info.isEstimated ? "추정치" : "API 실측"} | 환율 ${safeRate}원`,
         ];
         if (rerollCount > 0) {
             tooltipLines.push(`[리롤] ${rerollCount}회 숨은 비용 +${Math.round(rerollExtraKrw).toLocaleString()}원 (이 턴 총 ${Math.round(turnTotalKrw).toLocaleString()}원)`);
@@ -4354,7 +4739,18 @@ jQuery(async () => {
             });
         }
 
+        if (event_types.GENERATION_STARTED) {
+            eventSource.on(event_types.GENERATION_STARTED, (type, _opts, dryRun) => {
+                pendingGenerationType = dryRun ? null : (type || "normal");
+            });
+        }
+        if (typeof eventSource.makeFirst === "function") {
+            eventSource.makeFirst(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReadyFirst);
+        }
         eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
+        if (typeof eventSource.makeLast === "function") {
+            eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReadyLast);
+        }
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
         eventSource.on(event_types.CHAT_CHANGED, () => {
             // 이전 채팅방의 대형 프롬프트 참조 즉시 해제 (메모리 누수 방지)

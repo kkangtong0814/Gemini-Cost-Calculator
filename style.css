@@ -1,5 +1,5 @@
 /* =========================================================
-   Gemini Cost Calculator v2.3.1 - Clean Slate UI + Cache Shield
+   Gemini Cost Calculator v2.4.1 - Clean Slate UI + Dark Slate
    ========================================================= */
 
 .gcost-row {
@@ -74,6 +74,10 @@
     padding: 0 9px !important;
     font-size: 11px !important;
     border-radius: 6px !important;
+}
+
+.gcost-hidden {
+    display: none !important;
 }
 
 /* 채팅 말풍선 하단 비용 배지 (GCC 모달과 통일된 Clean Slate 미니멀 칩) */
@@ -189,6 +193,7 @@
     font-weight: 700;
     margin: 2px 0;
     color: #0f172a;
+    font-variant-numeric: tabular-nums;
 }
 
 .gcost-stat-sub {
@@ -426,12 +431,16 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
 }
 
 .gcost-card-title {
     font-size: 11.5px;
     font-weight: 600;
     color: #64748b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .gcost-card-main {
@@ -439,6 +448,7 @@
     font-weight: 800;
     color: #0f172a;
     letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
 }
 
 .gcost-card-sub {
@@ -664,6 +674,12 @@
 .gcost-mset-input:focus,
 .gcost-mset-select:focus {
     border-color: #334155;
+}
+
+.gcost-range-wrap {
+    height: 34px;
+    display: flex;
+    align-items: center;
 }
 
 .gcost-mset-quick-rates {
@@ -929,12 +945,26 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
     cursor: pointer;
     font-size: 12px;
     font-weight: 700;
     color: #475569;
     list-style: none;
     user-select: none;
+}
+
+.gcost-details-summary::after {
+    content: "▾";
+    font-size: 12px;
+    opacity: 0.7;
+    margin-left: 4px;
+    flex-shrink: 0;
+    transition: transform 0.16s ease;
+}
+
+.gcost-details[open] .gcost-details-summary::after {
+    transform: rotate(180deg);
 }
 
 .gcost-details-summary::-webkit-details-marker {
